@@ -75,7 +75,7 @@ export class PostgresSink implements RowSink {
 
   async open(): Promise<void> {
     await this.#connect();
-    await this.#client.query(`
+    await this.#createIfMissing(`
       CREATE TABLE IF NOT EXISTS ${this.#table} (
         id           uuid        PRIMARY KEY,
         user_email   text        NOT NULL,
@@ -114,7 +114,7 @@ export class PostgresSink implements RowSink {
       await this.#client.query('COMMIT');
       return path;
     } catch (error) {
-      await this.#client.query('ROLLBACK');
+      await this.#rollback(error);
       throw error;
     }
   }
@@ -150,15 +150,15 @@ export class PostgresSink implements RowSink {
   }
 
   async close(): Promise<void> {
-    // The CLI closes the sink even when the import failed before connecting.
+    // Only end a client we tried to connect; the CLI closes the sink even when nothing connected.
     if (this.#connected) await this.#client.end();
   }
 
-  /** Connects once, from whichever of lock / checkpoints.load / open runs first. */
+  /** Connects once, from whichever of checkpoints.load / checkpoints.clear / open runs first. */
   #connect(): Promise<void> {
     this.#connected ??= (async () => {
       await this.#client.connect();
-      await this.#client.query(`
+      await this.#createIfMissing(`
         CREATE TABLE IF NOT EXISTS import_checkpoints (
           key        text        PRIMARY KEY,
           checkpoint jsonb       NOT NULL,
@@ -167,6 +167,31 @@ export class PostgresSink implements RowSink {
       `);
     })();
     return this.#connected;
+  }
+
+  /**
+   * IF NOT EXISTS is not safe under concurrency (two sessions both create, the loser gets 23505),
+   * so DDL runs behind one global transaction-level advisory lock.
+   */
+  async #createIfMissing(ddl: string): Promise<void> {
+    await this.#client.query('BEGIN');
+    try {
+      await this.#client.query(
+        "SELECT pg_advisory_xact_lock(hashtextextended('csv-stream-processor:ddl', 0))",
+      );
+      await this.#client.query(ddl);
+      await this.#client.query('COMMIT');
+    } catch (error) {
+      await this.#rollback(error);
+      throw error;
+    }
+  }
+
+  /** Rolls back without masking `error`: a failed ROLLBACK is attached as `rollbackError`. */
+  async #rollback(error: unknown): Promise<void> {
+    await this.#client.query('ROLLBACK').catch((rollbackError: unknown) => {
+      (error as { rollbackError?: unknown }).rollbackError = rollbackError;
+    });
   }
 
   /** Includes the table, so imports of the same file into different tables don't collide. */

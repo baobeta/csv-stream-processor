@@ -19,6 +19,15 @@ const checkpointAt = (written: number): Checkpoint => ({
   counters: { processed: written, invalid: 0, written },
 });
 
+/** Drops a test table and any checkpoints stored for it. */
+const dropTable = async (name: string): Promise<void> => {
+  const client = new pg.Client({ connectionString: databaseUrl });
+  await client.connect();
+  await client.query(`DROP TABLE IF EXISTS ${name}`);
+  await client.query(`DELETE FROM import_checkpoints WHERE key LIKE $1`, [`${name}:%`]);
+  await client.end();
+};
+
 // Runs only when a database is configured (`pnpm db:up` + .env).
 describe.skipIf(!databaseUrl)('PostgresSink', () => {
   afterAll(async () => {
@@ -90,14 +99,41 @@ describe.skipIf(!databaseUrl)('PostgresSink', () => {
       expect(await sink.checkpoints.load(FILE)).toEqual(checkpointAt(1));
       expect(await sink.count()).toBe(1);
 
+      // The COPY succeeds but jsonb rejects \u0000, so the upsert fails: the row must roll back too.
+      await expect(
+        sink.writeBatch([tx(3)], { ...checkpointAt(3), target: 'bad\u0000' }),
+      ).rejects.toThrow(/unsupported Unicode escape sequence/);
+      expect(await sink.checkpoints.load(FILE)).toEqual(checkpointAt(1));
+      expect(await sink.count()).toBe(1);
+
+      // A batch with an already-stored id goes through the merge and still commits its checkpoint.
+      await sink.writeBatch([tx(1), tx(4)], checkpointAt(2));
+      expect(await sink.checkpoints.load(FILE)).toEqual(checkpointAt(2));
+      expect(await sink.count()).toBe(2);
+      expect(sink.stats).toEqual({ directBatches: 1, mergedBatches: 1 });
+
       await sink.checkpoints.clear(FILE);
       expect(await sink.checkpoints.load(FILE)).toBeUndefined();
     } finally {
       await sink.close();
-      const client = new pg.Client({ connectionString: databaseUrl });
-      await client.connect();
-      await client.query(`DROP TABLE IF EXISTS ${ckptTable}`);
-      await client.end();
+      await dropTable(ckptTable);
+    }
+  });
+
+  it('creates the tables safely when several sinks open at once', async () => {
+    // One round rarely loses the race, so try a few fresh tables.
+    for (let round = 0; round < 5; round++) {
+      const raceTable = `${table}_race${round}`;
+      const sinks = Array.from(
+        { length: 4 },
+        () => new PostgresSink(databaseUrl!, { table: raceTable }),
+      );
+      try {
+        await expect(Promise.all(sinks.map((s) => s.open()))).resolves.toBeDefined();
+      } finally {
+        await Promise.all(sinks.map((s) => s.close()));
+        await dropTable(raceTable);
+      }
     }
   });
 
