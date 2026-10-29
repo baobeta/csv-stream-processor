@@ -272,7 +272,7 @@ Each record follows the same shape: **decision**, **why**, **alternatives**, **t
   | Previous (file checkpoint) | 47.7 s  | 138.7 s | 93.2 s  |
   | Checkpoint in transaction  | 184.9 s | 34.3 s  | 109.6 s |
 
-  Both versions loaded 2,453,550 rows in every run. The spread within each version (91 s and 151 s) is far larger than the 16 s difference between the means, so this session shows no measurable cost, and also cannot rule out a small one. Two earlier runs of the new version in the same session took 89.4 s and 61.7 s. Re-measure on an idle machine before quoting absolute numbers.
+  Both versions loaded 2,453,550 rows in every run (this file had 2,450 invalid rows, hence 2,453,550 rather than the 2,453,500 of the older runs above). The spread within each version (91 s and 151 s) is far larger than the 16 s difference between the means, so no large regression was detected; because the machine was heavily loaded, a small difference cannot be ruled out. Two earlier runs of the new version in the same session took 89.4 s and 61.7 s. Re-measure on an idle machine before quoting absolute numbers.
 
 - **Choose differently when** the importer must not create tables or own any schema in the destination. Then keep the file checkpoint with an idempotent sink, or create `import_checkpoints` through your migration tool.
 
