@@ -84,6 +84,8 @@ export async function importCsv(options: ImportOptions): Promise<ImportResult> {
   // Rejects are rare, so they are appended synchronously: the size on disk then always matches
   // the size recorded in the checkpoint. On resume, rejects written after the last checkpoint
   // are cut off, because those rows are about to be read and rejected again.
+  // If the sink loses its lock mid-import (dropped connection), this worker can still append rejects
+  // for up to one batch before its next write fails, so concurrent workers must not share a rejects path.
   const rejectsFd = openSync(options.rejectsPath, resumeFrom ? 'a' : 'w');
   let rejectsBytes = 0;
   if (resumeFrom) {

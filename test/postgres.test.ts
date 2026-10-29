@@ -165,12 +165,34 @@ describe.skipIf(!databaseUrl)('PostgresSink', () => {
     await admin.connect();
     try {
       await sink.lock(FILE);
+      // Find only this sink's backend: the holder of its advisory lock. A bigint advisory key is
+      // split into classid (high 32 bits) and objid (low 32 bits), both unsigned oids, so rebuild
+      // it as (classid << 32) | objid in bigint arithmetic; this also holds for negative hashes.
       const { rows } = await admin.query<{ pid: number }>(
-        "SELECT pid FROM pg_stat_activity WHERE application_name = 'csv-stream-processor' AND pid <> pg_backend_pid()",
+        `SELECT pid FROM pg_locks
+         WHERE locktype = 'advisory' AND objsubid = 1 AND granted
+           AND ((classid::bigint << 32) | objid::bigint) = hashtextextended($1, 0)`,
+        [`${table}:${FILE}`],
       );
-      for (const { pid } of rows) await admin.query('SELECT pg_terminate_backend($1)', [pid]);
-      await new Promise((r) => setTimeout(r, 100));
+      expect(rows).toHaveLength(1);
+      const pid = rows[0]!.pid;
+      await admin.query('SELECT pg_terminate_backend($1)', [pid]);
+      for (let i = 0; i < 100; i++) {
+        const { rowCount } = await admin.query('SELECT 1 FROM pg_stat_activity WHERE pid = $1', [
+          pid,
+        ]);
+        if (rowCount === 0) break;
+        await new Promise((r) => setTimeout(r, 20));
+      }
       await expect(sink.count()).rejects.toThrow();
+
+      // The server released the lock with the session.
+      const other = new PostgresSink(databaseUrl!, { table });
+      try {
+        await other.lock(FILE);
+      } finally {
+        await other.close();
+      }
     } finally {
       await admin.end();
       await sink.close().catch(() => {});
