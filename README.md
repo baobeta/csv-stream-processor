@@ -341,16 +341,16 @@ The Postgres tests only run when `DATABASE_URL` is set; it is loaded from `.env`
 
 ## Troubleshooting
 
-| Symptom                                                             | Cause and fix                                                                                                                   |
-| ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| `TooManyInvalidRowsError` on resume although the first run was fine | Counters are restored, so the limit applies to the whole file. Raise `--max-invalid`.                                           |
-| `ExperimentalWarning: SQLite is an experimental feature`            | `node:sqlite` is still experimental in Node 24. The `pnpm import` script silences it.                                           |
-| An interrupted import does not resume                               | The checkpoint is only used when the file and destination match. Changing the file or `--sink`/`--db`/`--strategy` starts over. |
-| Ctrl+C under `pnpm import` exits with code 1                        | pnpm receives the signal too. Run `node src/cli.ts <file>` to see the real exit code 130.                                       |
-| Exit code 75: `another import of … is already running`              | Another process is importing the same file into the same table. Wait for it, or stop it; the lock is released when it exits.    |
-| `HeaderMismatchError`                                               | The header has missing, unexpected or duplicated columns. Fix the header; see [Input CSV](#input-csv).                          |
-| Port 5544 is already in use                                         | Change `ports` in [compose.yaml](compose.yaml) and `DATABASE_URL` in `.env`.                                                    |
-| SQLite inserts are very slow with UUID v4                           | Expected, see [Benchmarks](#benchmarks): use `--strategy staging` or UUID v7.                                                   |
+| Symptom                                                             | Cause and fix                                                                                                                                                               |
+| ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TooManyInvalidRowsError` on resume although the first run was fine | Counters are restored, so the limit applies to the whole file. Raise `--max-invalid`.                                                                                       |
+| `ExperimentalWarning: SQLite is an experimental feature`            | `node:sqlite` is still experimental in Node 24. The `pnpm import` script silences it.                                                                                       |
+| An interrupted import does not resume                               | The checkpoint is only used when the file and destination match. Changing the file or `--sink`/`--db`/`--strategy` starts over.                                             |
+| Ctrl+C under `pnpm import` exits with code 1                        | pnpm receives the signal too. Run the command behind `pnpm import` directly (see the exit codes under [`pnpm import`](#pnpm-import-filecsv)) to see the real exit code 130. |
+| Exit code 75: `another import of … is already running`              | Another process is importing the same file into the same table. Wait for it, or stop it; the lock is released when it exits.                                                |
+| `HeaderMismatchError`                                               | The header has missing, unexpected or duplicated columns. Fix the header; see [Input CSV](#input-csv).                                                                      |
+| Port 5544 is already in use                                         | Change `ports` in [compose.yaml](compose.yaml) and `DATABASE_URL` in `.env`.                                                                                                |
+| SQLite inserts are very slow with UUID v4                           | Expected, see [Benchmarks](#benchmarks): use `--strategy staging` or UUID v7.                                                                                               |
 
 TypeScript is pinned to 6.0 because `typescript-eslint` does not support TypeScript 7 yet.
 
