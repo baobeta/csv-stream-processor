@@ -1,9 +1,15 @@
+import { existsSync } from 'node:fs';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import pg from 'pg';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { Checkpoint } from '../src/checkpoint.ts';
+import { importCsv } from '../src/import.ts';
+import type { Transaction } from '../src/schema.ts';
 import { PostgresSink } from '../src/sinks/postgres.ts';
 import { ImportInProgressError } from '../src/sinks/types.ts';
-import { tx } from './helpers.ts';
+import { csvRow, HEADER, tx, uuid } from './helpers.ts';
 
 const databaseUrl = process.env.DATABASE_URL;
 // Locally these tests skip without a database; in CI a skip would hide a broken setup.
@@ -198,6 +204,61 @@ describe.skipIf(!databaseUrl)('PostgresSink', () => {
     } finally {
       await admin.end();
       await sink.close().catch(() => {});
+    }
+  });
+
+  it('resumes an import after a crash from the checkpoint committed with the last batch', async () => {
+    const e2eTable = `${table}_e2e`;
+    const dir = await mkdtemp(join(tmpdir(), 'postgres-e2e-'));
+    const file = join(dir, 'in.csv');
+    const unusedCheckpoint = join(dir, 'unused.json');
+    const rows = Array.from({ length: 10 }, (_, i) => csvRow(uuid(i + 1)));
+    await writeFile(file, `${HEADER}\n${rows.join('\n')}\n`);
+    const options = {
+      filePath: file,
+      rejectsPath: join(dir, 'rejects.ndjson'),
+      batchSize: 3,
+      checkpoint: { path: unusedCheckpoint, target: 'e2e' },
+    };
+
+    /** Dies right after batch 2 is committed, before importCsv hears back from writeBatch. */
+    class CrashingSink extends PostgresSink {
+      #batches = 0;
+      override async writeBatch(batch: Transaction[], checkpoint?: Checkpoint): Promise<void> {
+        await super.writeBatch(batch, checkpoint);
+        if (++this.#batches === 2) throw new Error('crash after commit');
+      }
+    }
+
+    try {
+      const crashing = new CrashingSink(databaseUrl!, { table: e2eTable });
+      try {
+        await expect(importCsv({ ...options, sink: crashing })).rejects.toThrow(
+          'crash after commit',
+        );
+        expect(await crashing.count()).toBe(6);
+        const saved = await crashing.checkpoints.load(resolve(file));
+        expect(saved?.counters.written).toBe(6);
+      } finally {
+        await crashing.close();
+      }
+
+      const sink = new PostgresSink(databaseUrl!, { table: e2eTable });
+      try {
+        const result = await importCsv({ ...options, sink });
+        expect(result).toMatchObject({ resumed: true, written: 10 });
+        expect(await sink.count()).toBe(10);
+        // Batches 1-2 are not replayed: the remaining 4 rows are new, so every batch takes the fast path.
+        expect(sink.stats).toEqual({ directBatches: 2, mergedBatches: 0 });
+        expect(await sink.checkpoints.load(resolve(file))).toBeUndefined();
+      } finally {
+        await sink.close();
+      }
+      // The sink keeps its own checkpoints, so the file checkpoint is never written.
+      expect(existsSync(unusedCheckpoint)).toBe(false);
+    } finally {
+      await dropTable(e2eTable);
+      await rm(dir, { recursive: true, force: true });
     }
   });
 
