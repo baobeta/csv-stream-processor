@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { importCsv } from '../src/import.ts';
 import { TooManyInvalidRowsError } from '../src/pipeline/error-policy.ts';
+import { HeaderMismatchError } from '../src/pipeline/header.ts';
 import type { Transaction } from '../src/schema.ts';
 import type { RowSink } from '../src/sinks/types.ts';
 
@@ -110,5 +111,18 @@ describe('importCsv', () => {
         maxInvalidRows: 1,
       }),
     ).rejects.toBeInstanceOf(TooManyInvalidRowsError);
+  });
+
+  it('rejects a file with a wrong header before reading any row', async () => {
+    const filePath = await writeCsv([
+      'id,user_email,amt,currency,status,created_at,description',
+      row(ids[0]!),
+    ]);
+    const sink = new MemorySink();
+
+    await expect(
+      importCsv({ filePath, sink, rejectsPath: join(dir, 'r.ndjson'), maxInvalidRows: 10 }),
+    ).rejects.toBeInstanceOf(HeaderMismatchError);
+    expect(sink.batches).toEqual([]);
   });
 });

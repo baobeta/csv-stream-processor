@@ -7,12 +7,12 @@
  * Approaches mirror what tutorials and projects commonly do, from naive to this repo:
  *   row-insert      parse with csv-parse, one INSERT per row (autocommit), no validation
  *   batched-insert  parse with csv-parse, multi-row INSERT of 1000 rows, no validation
- *   this-repo       importCsv() + PostgresSink: validation, rejects, COPY, checkpoints
+ *   this-repo       importCsv() + PostgresSink: validation, rejects, COPY, a checkpoint per batch
+ *                   (always from the first row: a checkpoint left by an aborted run is ignored)
  *
  * The native `psql \copy` baseline is run from the shell; see docs/design-and-benchmarks.md.
  */
 import { createReadStream } from 'node:fs';
-import { rm } from 'node:fs/promises';
 import { parse } from 'csv-parse';
 import pg from 'pg';
 import { importCsv } from '../src/import.ts';
@@ -80,8 +80,6 @@ async function batchedInsert(client: pg.Client): Promise<number> {
 }
 
 async function thisRepo(): Promise<number> {
-  const checkpoint = 'data/compare.checkpoint.json';
-  await rm(checkpoint, { force: true });
   const sink = new PostgresSink(databaseUrl!, { table: 'compare_repo_transactions' });
   const admin = new pg.Client({ connectionString: databaseUrl });
   await admin.connect();
@@ -93,7 +91,11 @@ async function thisRepo(): Promise<number> {
       sink,
       rejectsPath: 'data/compare-rejects.ndjson',
       maxInvalidRows: Number.POSITIVE_INFINITY,
-      checkpoint: { path: checkpoint, target: 'compare' },
+      // Checkpointing stays on so each batch commits its checkpoint, as a real import does. The
+      // checkpoint lives in import_checkpoints (`path` is unused for Postgres), and the table was
+      // just dropped, so `fresh` ignores one left behind by an aborted run instead of resuming.
+      checkpoint: { path: 'data/compare.checkpoint.json', target: 'compare' },
+      fresh: true,
     });
     return result.written;
   } finally {

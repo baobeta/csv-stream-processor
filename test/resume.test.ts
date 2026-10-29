@@ -1,10 +1,11 @@
 import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { importCsv, type ImportOptions } from '../src/import.ts';
+import type { Checkpoint } from '../src/checkpoint.ts';
 import type { Transaction } from '../src/schema.ts';
-import type { RowSink } from '../src/sinks/types.ts';
+import type { CheckpointStore, RowSink } from '../src/sinks/types.ts';
 import { csvRow, HEADER, uuid } from './helpers.ts';
 
 /** Counts how often each id is written, and can simulate a crash on the n-th batch. */
@@ -20,6 +21,38 @@ class CountingSink implements RowSink {
   writeBatch(rows: Transaction[]) {
     if (++this.#batches === this.#crashOnBatch) throw new Error('simulated crash');
     for (const r of rows) this.writes.set(r.id, (this.writes.get(r.id) ?? 0) + 1);
+  }
+  close() {}
+}
+
+/**
+ * Commits rows and checkpoint together, like PostgresSink, and can crash right *after* a commit:
+ * the moment where a file checkpoint would still point at the previous batch.
+ */
+class TransactionalSink implements RowSink {
+  readonly writes: Map<string, number>;
+  readonly saved: Map<string, Checkpoint>;
+  readonly checkpoints: CheckpointStore;
+  readonly #crashAfterBatch: number | undefined;
+  #batches = 0;
+
+  constructor(
+    writes: Map<string, number>,
+    saved: Map<string, Checkpoint>,
+    crashAfterBatch?: number,
+  ) {
+    this.writes = writes;
+    this.saved = saved;
+    this.#crashAfterBatch = crashAfterBatch;
+    this.checkpoints = {
+      load: (key) => Promise.resolve(saved.get(key)),
+      clear: (key) => Promise.resolve(void saved.delete(key)),
+    };
+  }
+  writeBatch(rows: Transaction[], checkpoint?: Checkpoint) {
+    for (const r of rows) this.writes.set(r.id, (this.writes.get(r.id) ?? 0) + 1);
+    if (checkpoint) this.saved.set(checkpoint.filePath, structuredClone(checkpoint));
+    if (++this.#batches === this.#crashAfterBatch) throw new Error('crash after commit');
   }
   close() {}
 }
@@ -77,6 +110,36 @@ describe('resume from checkpoint', () => {
     expect(result).toMatchObject({ resumed: true, processed: 12, invalid: 2, written: 10 });
     expect([...writes.values()].every((n) => n === 1)).toBe(true);
     expect(writes.size).toBe(10);
+    expect(await exists(base.checkpoint!.path)).toBe(false);
+
+    const rejects = (await readFile(base.rejectsPath, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((l) => JSON.parse(l));
+    expect(rejects.map((r) => [r.line, r.raw.id])).toEqual([
+      [6, uuid(100)],
+      [12, uuid(101)],
+    ]);
+  });
+
+  it('never replays a batch when the sink commits the checkpoint with the rows', async () => {
+    const writes = new Map<string, number>();
+    const saved = new Map<string, Checkpoint>();
+
+    // Valid rows in batches of 3: [v0-v2] [v3-v5] [v6-v8] [v9]. Batch 3 commits, then the process dies.
+    await expect(
+      importCsv({ ...base, sink: new TransactionalSink(writes, saved, 3) }),
+    ).rejects.toThrow('crash after commit');
+    expect(writes.size).toBe(9);
+    expect(saved.get(resolve(base.filePath))).toMatchObject({ counters: { written: 9 } });
+
+    const result = await importCsv({ ...base, sink: new TransactionalSink(writes, saved) });
+
+    expect(result).toMatchObject({ resumed: true, processed: 12, invalid: 2, written: 10 });
+    expect([...writes.values()].every((n) => n === 1)).toBe(true);
+    expect(writes.size).toBe(10);
+    expect(saved.size).toBe(0);
+    // The sink owns the checkpoint, so no file is written.
     expect(await exists(base.checkpoint!.path)).toBe(false);
 
     const rejects = (await readFile(base.rejectsPath, 'utf8'))

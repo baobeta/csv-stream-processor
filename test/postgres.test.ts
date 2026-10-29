@@ -1,10 +1,41 @@
+import { existsSync } from 'node:fs';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import pg from 'pg';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
+import type { Checkpoint } from '../src/checkpoint.ts';
+import { importCsv } from '../src/import.ts';
+import type { Transaction } from '../src/schema.ts';
 import { PostgresSink } from '../src/sinks/postgres.ts';
-import { tx } from './helpers.ts';
+import { ImportInProgressError } from '../src/sinks/types.ts';
+import { csvRow, HEADER, tx, uuid } from './helpers.ts';
 
 const databaseUrl = process.env.DATABASE_URL;
+// Locally these tests skip without a database; in CI a skip would hide a broken setup.
+if (process.env.CI && !databaseUrl) throw new Error('DATABASE_URL must be set in CI');
 const table = `test_transactions_${process.pid}`;
+const FILE = '/data/a.csv';
+const checkpointAt = (written: number): Checkpoint => ({
+  filePath: FILE,
+  fileSize: 1_000,
+  fileMtimeMs: 1_700_000_000_000.5,
+  target: 'test',
+  columns: ['id', 'amount'],
+  bytes: written * 10,
+  lines: written + 1,
+  rejectsBytes: 0,
+  counters: { processed: written, invalid: 0, written },
+});
+
+/** Drops a test table and any checkpoints stored for it. */
+const dropTable = async (name: string): Promise<void> => {
+  const client = new pg.Client({ connectionString: databaseUrl });
+  await client.connect();
+  await client.query(`DROP TABLE IF EXISTS ${name}`);
+  await client.query(`DELETE FROM import_checkpoints WHERE key LIKE $1`, [`${name}:%`]);
+  await client.end();
+};
 
 // Runs only when a database is configured (`pnpm db:up` + .env).
 describe.skipIf(!databaseUrl)('PostgresSink', () => {
@@ -59,6 +90,253 @@ describe.skipIf(!databaseUrl)('PostgresSink', () => {
       await client.query(`DROP TABLE IF EXISTS ${dupTable}`);
       await client.end();
     }
+  });
+
+  it('commits the checkpoint in the same transaction as the batch', async () => {
+    const ckptTable = `${table}_ckpt`;
+    const sink = new PostgresSink(databaseUrl!, { table: ckptTable });
+    try {
+      expect(await sink.checkpoints.load(FILE)).toBeUndefined();
+      await sink.open();
+      await sink.writeBatch([tx(1)], checkpointAt(1));
+      expect(await sink.checkpoints.load(FILE)).toEqual(checkpointAt(1));
+
+      // 'TOOLONG' overflows char(3), so the COPY fails: neither the row nor the newer checkpoint lands.
+      await expect(
+        sink.writeBatch([tx(2, { currency: 'TOOLONG' as 'USD' })], checkpointAt(2)),
+      ).rejects.toThrow(/too long/);
+      expect(await sink.checkpoints.load(FILE)).toEqual(checkpointAt(1));
+      expect(await sink.count()).toBe(1);
+
+      // The COPY succeeds but jsonb rejects \u0000, so the upsert fails: the row must roll back too.
+      await expect(
+        sink.writeBatch([tx(3)], { ...checkpointAt(3), target: 'bad\u0000' }),
+      ).rejects.toThrow(/unsupported Unicode escape sequence/);
+      expect(await sink.checkpoints.load(FILE)).toEqual(checkpointAt(1));
+      expect(await sink.count()).toBe(1);
+
+      // A batch with an already-stored id goes through the merge and still commits its checkpoint.
+      await sink.writeBatch([tx(1), tx(4)], checkpointAt(2));
+      expect(await sink.checkpoints.load(FILE)).toEqual(checkpointAt(2));
+      expect(await sink.count()).toBe(2);
+      expect(sink.stats).toEqual({ directBatches: 1, mergedBatches: 1 });
+
+      await sink.checkpoints.clear(FILE);
+      expect(await sink.checkpoints.load(FILE)).toBeUndefined();
+    } finally {
+      await sink.close();
+      await dropTable(ckptTable);
+    }
+  });
+
+  it('creates the tables safely when several sinks open at once', async () => {
+    // One round rarely loses the race, so try a few fresh tables.
+    for (let round = 0; round < 5; round++) {
+      const raceTable = `${table}_race${round}`;
+      const sinks = Array.from(
+        { length: 4 },
+        () => new PostgresSink(databaseUrl!, { table: raceTable }),
+      );
+      try {
+        await expect(Promise.all(sinks.map((s) => s.open()))).resolves.toBeDefined();
+      } finally {
+        await Promise.all(sinks.map((s) => s.close()));
+        await dropTable(raceTable);
+      }
+    }
+  });
+
+  it('lets only one import of a file run at a time', async () => {
+    const first = new PostgresSink(databaseUrl!, { table });
+    const second = new PostgresSink(databaseUrl!, { table });
+    try {
+      await first.lock(FILE);
+      await expect(second.lock(FILE)).rejects.toBeInstanceOf(ImportInProgressError);
+      await second.lock('/data/other.csv');
+    } finally {
+      await first.close();
+      await second.close();
+    }
+
+    // Closing the connection released the lock.
+    const third = new PostgresSink(databaseUrl!, { table });
+    try {
+      await third.lock(FILE);
+    } finally {
+      await third.close();
+    }
+  });
+
+  it('survives the server dropping the connection and fails the next query instead', async () => {
+    const sink = new PostgresSink(databaseUrl!, { table });
+    const admin = new pg.Client({ connectionString: databaseUrl });
+    await admin.connect();
+    try {
+      await sink.lock(FILE);
+      // Find only this sink's backend: the holder of its advisory lock. A bigint advisory key is
+      // split into classid (high 32 bits) and objid (low 32 bits), both unsigned oids, so rebuild
+      // it as (classid << 32) | objid in bigint arithmetic; this also holds for negative hashes.
+      const { rows } = await admin.query<{ pid: number }>(
+        `SELECT pid FROM pg_locks
+         WHERE locktype = 'advisory' AND objsubid = 1 AND granted
+           AND ((classid::bigint << 32) | objid::bigint) = hashtextextended($1, 0)`,
+        [`${table}:${FILE}`],
+      );
+      expect(rows).toHaveLength(1);
+      const pid = rows[0]!.pid;
+      await admin.query('SELECT pg_terminate_backend($1)', [pid]);
+      for (let i = 0; i < 100; i++) {
+        const { rowCount } = await admin.query('SELECT 1 FROM pg_stat_activity WHERE pid = $1', [
+          pid,
+        ]);
+        if (rowCount === 0) break;
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      await expect(sink.count()).rejects.toThrow();
+
+      // The server released the lock with the session.
+      const other = new PostgresSink(databaseUrl!, { table });
+      try {
+        await other.lock(FILE);
+      } finally {
+        await other.close();
+      }
+    } finally {
+      await admin.end();
+      await sink.close().catch(() => {});
+    }
+  });
+
+  it('resumes an import after a crash from the checkpoint committed with the last batch', async () => {
+    const e2eTable = `${table}_e2e`;
+    const dir = await mkdtemp(join(tmpdir(), 'postgres-e2e-'));
+    const file = join(dir, 'in.csv');
+    const unusedCheckpoint = join(dir, 'unused.json');
+    const rows = Array.from({ length: 10 }, (_, i) => csvRow(uuid(i + 1)));
+    await writeFile(file, `${HEADER}\n${rows.join('\n')}\n`);
+    const options = {
+      filePath: file,
+      rejectsPath: join(dir, 'rejects.ndjson'),
+      batchSize: 3,
+      checkpoint: { path: unusedCheckpoint, target: 'e2e' },
+    };
+
+    /** Dies right after batch 2 is committed, before importCsv hears back from writeBatch. */
+    class CrashingSink extends PostgresSink {
+      #batches = 0;
+      override async writeBatch(batch: Transaction[], checkpoint?: Checkpoint): Promise<void> {
+        await super.writeBatch(batch, checkpoint);
+        if (++this.#batches === 2) throw new Error('crash after commit');
+      }
+    }
+
+    try {
+      const crashing = new CrashingSink(databaseUrl!, { table: e2eTable });
+      try {
+        await expect(importCsv({ ...options, sink: crashing })).rejects.toThrow(
+          'crash after commit',
+        );
+        expect(await crashing.count()).toBe(6);
+        const saved = await crashing.checkpoints.load(resolve(file));
+        expect(saved?.counters.written).toBe(6);
+      } finally {
+        await crashing.close();
+      }
+
+      const sink = new PostgresSink(databaseUrl!, { table: e2eTable });
+      try {
+        const result = await importCsv({ ...options, sink });
+        expect(result).toMatchObject({ resumed: true, written: 10 });
+        expect(await sink.count()).toBe(10);
+        // Batches 1-2 are not replayed: the remaining 4 rows are new, so every batch takes the fast path.
+        expect(sink.stats).toEqual({ directBatches: 2, mergedBatches: 0 });
+        expect(await sink.checkpoints.load(resolve(file))).toBeUndefined();
+      } finally {
+        await sink.close();
+      }
+      // The sink keeps its own checkpoints, so the file checkpoint is never written.
+      expect(existsSync(unusedCheckpoint)).toBe(false);
+    } finally {
+      await dropTable(e2eTable);
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  describe('retrying a rolled-back batch', () => {
+    const retryTable = `${table}_retry`;
+    const seq = `${retryTable}_attempts`;
+    const fn = `${retryTable}_fail`;
+    let admin: pg.Client;
+    let sink: PostgresSink;
+
+    beforeEach(async () => {
+      sink = new PostgresSink(databaseUrl!, { table: retryTable });
+      await sink.open();
+      admin = new pg.Client({ connectionString: databaseUrl });
+      await admin.connect();
+      await admin.query(`CREATE SEQUENCE ${seq}`);
+    });
+
+    afterEach(async () => {
+      await sink.close();
+      await admin.query(`DROP TABLE IF EXISTS ${retryTable}`);
+      await admin.query(`DROP FUNCTION IF EXISTS ${fn}()`);
+      await admin.query(`DROP SEQUENCE IF EXISTS ${seq}`);
+      await admin.end();
+      await dropTable(retryTable);
+    });
+
+    /**
+     * Makes the first `failures` inserts raise `code`. Sequences are not rolled back, so the
+     * sequence counts attempts across ROLLBACKs. nextval runs per row: tests use single-row
+     * batches so one row is one attempt.
+     */
+    const failFirst = async (failures: number, code: string): Promise<void> => {
+      await admin.query(`
+        CREATE FUNCTION ${fn}() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          IF nextval('${seq}') <= ${failures} THEN
+            RAISE EXCEPTION 'forced' USING ERRCODE = '${code}';
+          END IF;
+          RETURN NEW;
+        END $$`);
+      await admin.query(
+        `CREATE TRIGGER force_failure BEFORE INSERT ON ${retryTable}
+         FOR EACH ROW EXECUTE FUNCTION ${fn}()`,
+      );
+    };
+
+    const attempts = async (): Promise<number> => {
+      const { rows } = await admin.query<{ n: string }>(
+        `SELECT CASE WHEN is_called THEN last_value ELSE 0 END AS n FROM ${seq}`,
+      );
+      return Number(rows[0]!.n);
+    };
+
+    it('retries a serialization failure and then commits batch and checkpoint', async () => {
+      await failFirst(2, '40001');
+      await sink.writeBatch([tx(1)], checkpointAt(1));
+      expect(await attempts()).toBe(3);
+      expect(await sink.count()).toBe(1);
+      expect(await sink.checkpoints.load(FILE)).toEqual(checkpointAt(1));
+      expect(sink.stats).toEqual({ directBatches: 1, mergedBatches: 0 });
+    });
+
+    it('gives up after three attempts and leaves nothing behind', async () => {
+      await failFirst(100, '40001');
+      await expect(sink.writeBatch([tx(1)], checkpointAt(1))).rejects.toMatchObject({
+        code: '40001',
+      });
+      expect(await attempts()).toBe(3);
+      expect(await sink.count()).toBe(0);
+      expect(await sink.checkpoints.load(FILE)).toBeUndefined();
+    });
+
+    it('does not retry other errors', async () => {
+      await failFirst(100, '22023');
+      await expect(sink.writeBatch([tx(1)])).rejects.toMatchObject({ code: '22023' });
+      expect(await attempts()).toBe(1);
+    });
   });
 
   it('rejects table names that are not plain identifiers', () => {

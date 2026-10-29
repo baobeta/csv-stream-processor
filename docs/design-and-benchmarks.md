@@ -54,6 +54,10 @@ This is where the approaches differ most. With the same file containing 2,500 br
 | One row at a time                                                              | ❌ Stops at the first bad date, also leaving a half-filled table with no record of where it stopped.                                                                                           |
 | **This project**                                                               | ✅ Loads all 2,453,500 good rows. Writes all 2,500 bad rows to a separate file with line number and reason.                                                                                    |
 
+### What happens when an import is interrupted or run twice
+
+When loading into Postgres, the importer writes down how far it got **in the same step** as the rows themselves, so after a crash or a restart it continues exactly where it stopped and never loads a group of rows twice. If someone starts the same file a second time while the first import is still running, the second one stops immediately with a clear message instead of competing with the first. A server asking the importer to stop (as happens during a deployment) is handled like pressing Ctrl+C: rows already saved are kept, and the next run continues from there.
+
 ### The bottom line
 
 This project is **not the fastest tool at any single step**, and it does not claim to be. It is designed to be **correct, safe with messy real-world data, and able to recover from interruptions**, while staying between level with and 2× slower than the fastest possible baseline, and keeping memory flat no matter how large the file is.
@@ -229,6 +233,7 @@ Each record follows the same shape: **decision**, **why**, **alternatives**, **t
 - **Alternatives.** Store the checkpoint in the database within the same transaction (true exactly-once, no idempotency needed, but couples the importer to the destination's schema).
 - **Tradeoff.** A replayed batch is re-validated and re-written. The checkpoint file lives next to the data, so it must not be shared between machines.
 - **Choose differently when** the destination cannot be made idempotent. Then put the checkpoint in the database transaction.
+- **Superseded for Postgres** by [decision 14](#14-checkpoint-inside-the-database-transaction). SQLite still uses the file.
 
 #### 11. Truncate the rejects file on resume
 
@@ -253,6 +258,38 @@ Each record follows the same shape: **decision**, **why**, **alternatives**, **t
 - **Alternatives.** `tsc` build, or `tsx`.
 - **Tradeoff.** No enums, namespaces or constructor parameter properties. `node:sqlite` is still experimental in Node 24 (its warning is silenced in the scripts).
 - **Choose differently when** you need to support older Node versions or publish a library: add a build step.
+
+#### 14. Checkpoint inside the database transaction
+
+- **Decision.** Sinks may provide their own checkpoint store. The Postgres sink keeps the checkpoint as `jsonb` in an `import_checkpoints` table, keyed on `<table>:<absolute file path>`, and upserts it in the same transaction as each batch. The row is deleted when the file is complete. `--checkpoint` is now only used by SQLite.
+- **Why.** The checkpoint file of decision 10 is a second write after the commit. A crash between the two replays one batch on resume. `ON CONFLICT DO NOTHING` hid that replay, so it never showed up as a wrong count, but it was still extra work and depended on idempotency for correctness. Committing rows and checkpoint together means they cannot disagree: a resumed import starts exactly after the last committed batch.
+- **Alternatives.** Keep the file and rely on idempotency (decision 10). Write the checkpoint to a separate store, such as Redis (still two writes, same gap).
+- **Tradeoff.** One small upsert per batch, about 490 for the 2.456-million-row file. The importer creates `import_checkpoints` itself with `CREATE TABLE IF NOT EXISTS`, so it needs `CREATE` privilege on the schema, and two importers starting at once could race on that DDL; it therefore runs behind a global transaction-level advisory lock. `ON CONFLICT DO NOTHING` is kept for re-imports of the same file, so duplicate ids are still skipped rather than updated, and `written` counts rows handed to the sink, not rows inserted.
+- **Measured.** Interleaved A/B against the previous version (`master`), 300 MB file, `--fresh`, table truncated before each run, run in the order master, branch, master, branch. The machine was heavily loaded by unrelated work (load average 14–30):
+
+  | Version                    | Run 1   | Run 2   | Mean    |
+  | -------------------------- | ------- | ------- | ------- |
+  | Previous (file checkpoint) | 47.7 s  | 138.7 s | 93.2 s  |
+  | Checkpoint in transaction  | 184.9 s | 34.3 s  | 109.6 s |
+
+  Both versions loaded 2,453,550 rows in every run (this file had 2,450 invalid rows, hence 2,453,550 rather than the 2,453,500 of the older runs above). The spread within each version (91 s and 151 s) is far larger than the 16 s difference between the means, so no large regression was detected; because the machine was heavily loaded, a small difference cannot be ruled out. Two earlier runs of the new version in the same session took 89.4 s and 61.7 s. Re-measure on an idle machine before quoting absolute numbers.
+
+- **Choose differently when** the importer must not create tables or own any schema in the destination. Then keep the file checkpoint with an idempotent sink, or create `import_checkpoints` through your migration tool.
+
+#### 15. One import per file, retries for transient conflicts, and a bounded shutdown
+
+- **Decision.** Three related rules for running the importer as a job:
+  - **Lock.** Before reading the checkpoint, the Postgres sink takes a session-level advisory lock (`pg_try_advisory_lock`) on `<table>:<absolute file path>`. If another session holds it, the import fails with `ImportInProgressError` and exit code 75 (`EX_TEMPFAIL`).
+  - **Retry.** A batch rolled back with `40001` (serialization failure) or `40P01` (deadlock) is retried, up to 3 attempts in total, with exponential backoff and full jitter (base 100 ms). Other errors, and any error where `ROLLBACK` itself failed, are not retried.
+  - **Shutdown.** `SIGTERM` is handled like Ctrl+C: stop reading, keep committed batches, exit 143 (Ctrl+C: 130). If shutdown takes longer than 10 s, the process prints a message and exits anyway.
+- **Why.** Two workers resuming from the same checkpoint would both write the same batches and both truncate and append to the rejects file. Locking before the checkpoint is read prevents that. A session-level lock is released by Postgres if the process dies, so a crash never leaves a stale lock. Serialization failures and deadlocks are transient by definition: Postgres has rolled the transaction back and the same batch can simply run again. Container platforms stop jobs with `SIGTERM`, not `SIGINT`, so without the handler a deployment would kill the import mid-batch.
+- **Alternatives.** A lock row in a table (survives crashes, so needs expiry and cleanup). No lock, relying on idempotency (correct rows, but duplicated work and a corrupted rejects file). Retrying lost connections in-process (would need to re-take the lock and re-create the temp table on a new session).
+- **Tradeoff.**
+  - A lost connection is not retried in-process, because the lock and the temp table die with the session. The import fails, and running it again resumes from the checkpoint, so the job runner must retry.
+  - If the connection drops mid-import, the lock is gone while this worker may still append rejects for up to one batch before its next write fails. Concurrent workers must not share a rejects path.
+  - 10 s is a guess at "a batch normally commits within a second" with margin. It is deliberately below Kubernetes' default 30 s `terminationGracePeriodSeconds`, so the importer exits on its own before `SIGKILL`. A larger batch size or a slow database may need a longer grace period on both sides.
+  - The lock is per file path and table. The same content under a different path is not detected.
+- **Choose differently when** imports are scheduled by a queue that already guarantees one consumer per file. Then the lock is a cheap second guard, not the main one.
 
 ### Where other tools are the better choice
 

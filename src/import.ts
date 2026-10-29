@@ -12,9 +12,10 @@ import { pipeline } from 'node:stream/promises';
 import { parse, type Parser } from 'csv-parse';
 import { clearCheckpoint, loadCheckpoint, saveCheckpoint, type Checkpoint } from './checkpoint.ts';
 import { batch } from './pipeline/batch.ts';
+import { checkHeader } from './pipeline/header.ts';
 import type { ErrorPolicy, ImportCounters } from './pipeline/error-policy.ts';
 import { validateRows, type StreamPosition } from './pipeline/validate.ts';
-import type { RowSink } from './sinks/types.ts';
+import type { CheckpointStore, RowSink } from './sinks/types.ts';
 
 export interface ImportOptions {
   filePath: string;
@@ -25,6 +26,7 @@ export interface ImportOptions {
   /**
    * Save progress after every committed batch and continue from it on the next run.
    * `target` identifies the destination so a checkpoint is never applied to another database.
+   * `path` is only used when the sink has no `checkpoints` store of its own.
    */
   checkpoint?: { path: string; target: string };
   /** Ignore an existing checkpoint and start from the first row. */
@@ -63,7 +65,9 @@ export async function importCsv(options: ImportOptions): Promise<ImportResult> {
     fileMtimeMs: file.mtimeMs,
     target: options.checkpoint?.target ?? '',
   };
-  const resumeFrom = await findResumableCheckpoint(options, identity);
+  // Locked before the checkpoint is read, so two workers can never resume from the same one.
+  await sink.lock?.(identity.filePath);
+  const resumeFrom = await findResumableCheckpoint(options, identity, sink.checkpoints);
 
   const counters: ImportCounters = resumeFrom
     ? { ...resumeFrom.counters }
@@ -80,6 +84,8 @@ export async function importCsv(options: ImportOptions): Promise<ImportResult> {
   // Rejects are rare, so they are appended synchronously: the size on disk then always matches
   // the size recorded in the checkpoint. On resume, rejects written after the last checkpoint
   // are cut off, because those rows are about to be read and rejected again.
+  // If the sink loses its lock mid-import (dropped connection), this worker can still append rejects
+  // for up to one batch before its next write fails, so concurrent workers must not share a rejects path.
   const rejectsFd = openSync(options.rejectsPath, resumeFrom ? 'a' : 'w');
   let rejectsBytes = 0;
   if (resumeFrom) {
@@ -93,6 +99,7 @@ export async function importCsv(options: ImportOptions): Promise<ImportResult> {
     },
   };
 
+  const checkpointPath = options.checkpoint?.path;
   const startedAtMs = performance.now();
   const reportProgress = () =>
     options.onProgress?.({
@@ -114,8 +121,9 @@ export async function importCsv(options: ImportOptions): Promise<ImportResult> {
     await pipeline(
       input,
       parse({
-        // A resumed read starts after the header, so reuse the header saved in the checkpoint.
-        columns: resumeFrom ? resumeFrom.columns : true,
+        // A resumed read starts after the header, so reuse the header saved in the checkpoint
+        // (it was checked on the first run). csv-parse rethrows checkHeader's error unchanged.
+        columns: resumeFrom ? resumeFrom.columns : checkHeader,
         bom: true,
         skip_empty_lines: true,
         trim: true,
@@ -130,27 +138,35 @@ export async function importCsv(options: ImportOptions): Promise<ImportResult> {
       (source) => batch(source, batchSize),
       async (source) => {
         for await (const rows of source) {
-          await sink.writeBatch(rows);
-          counters.written += rows.length;
-          // Saved only after the batch is committed. A crash between commit and save replays
-          // one batch on resume, which the idempotent sink absorbs (at-least-once + idempotent).
-          if (options.checkpoint) {
-            await saveCheckpoint(options.checkpoint.path, {
-              ...identity,
-              columns: position.columns ?? [],
-              bytes: position.bytes,
-              lines: position.lines,
-              rejectsBytes,
-              counters: { ...counters },
-            });
+          const checkpoint: Checkpoint | undefined = options.checkpoint && {
+            ...identity,
+            columns: position.columns ?? [],
+            bytes: position.bytes,
+            lines: position.lines,
+            rejectsBytes,
+            counters: { ...counters, written: counters.written + rows.length },
+          };
+          if (sink.checkpoints) {
+            // Committed atomically with the rows: a crash can no longer replay this batch.
+            await sink.writeBatch(rows, checkpoint);
+          } else {
+            await sink.writeBatch(rows);
+            // Saved only after the batch is committed. A crash between commit and save replays
+            // one batch on resume, which the idempotent sink absorbs (at-least-once + idempotent).
+            if (checkpoint && checkpointPath) await saveCheckpoint(checkpointPath, checkpoint);
           }
+          counters.written += rows.length;
         }
       },
       { signal: options.signal },
     );
 
     await sink.finish?.();
-    if (options.checkpoint) await clearCheckpoint(options.checkpoint.path);
+    if (options.checkpoint) {
+      await (sink.checkpoints
+        ? sink.checkpoints.clear(identity.filePath)
+        : clearCheckpoint(options.checkpoint.path));
+    }
     reportProgress();
   } finally {
     clearInterval(timer);
@@ -167,9 +183,12 @@ export async function importCsv(options: ImportOptions): Promise<ImportResult> {
 async function findResumableCheckpoint(
   options: ImportOptions,
   identity: Pick<Checkpoint, 'filePath' | 'fileSize' | 'fileMtimeMs' | 'target'>,
+  store: CheckpointStore | undefined,
 ): Promise<Checkpoint | undefined> {
   if (!options.checkpoint || options.fresh) return undefined;
-  const saved = await loadCheckpoint(options.checkpoint.path);
+  const saved = store
+    ? await store.load(identity.filePath)
+    : await loadCheckpoint(options.checkpoint.path);
   // A checkpoint for a different or modified file (or another database) would point at
   // meaningless byte offsets, so it is ignored and overwritten by this run.
   const matches =
