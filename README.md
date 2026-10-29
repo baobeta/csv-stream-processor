@@ -121,6 +121,12 @@ Exit codes:
 
 On `SIGINT` or `SIGTERM` the import stops reading, keeps every committed batch, and exits. If it has not finished within 10 seconds (for example a query is stuck), it prints a message and exits anyway with the same code; 10 s stays below Kubernetes' default 30 s `terminationGracePeriodSeconds`. While it is stopping, a second, different signal is ignored; sending the same signal again kills the process immediately with Node's default behaviour.
 
+These are the exit codes of `node src/cli.ts …`. Under `pnpm import`, pnpm receives the signal as well and may exit with its own code (see [Troubleshooting](#troubleshooting)). In a container, use the command behind `pnpm import` as the entrypoint, so the orchestrator sees 130, 143 and 75:
+
+```bash
+node --env-file-if-exists=.env --disable-warning=ExperimentalWarning src/cli.ts data/transactions.csv --sink postgres
+```
+
 ### `pnpm bench <file.csv>`
 
 | Option          | Default                        | Meaning                                              |
@@ -233,7 +239,7 @@ Sink lifecycle: `lock` (optional) → `open` → `writeBatch` (many times) → `
 - `COPY` is the fastest way to bulk-load Postgres, but it cannot skip duplicates. Duplicates only appear when a batch is replayed after a crash or a file is re-imported, so the common case takes the plain `COPY` path. Always merging through the temp table was 2.5× slower ([details](docs/design-and-benchmarks.md#a-bug-the-benchmark-found)); `sink.stats` reports how many batches took each path.
 - When escaping CSV for `COPY`, empty strings must be quoted (`""`), because `COPY ... (FORMAT csv)` reads an unquoted empty field as `NULL`.
 - Staging: on resume the staging table is kept; on a fresh run it is cleared, so leftovers from an abandoned run are never merged by mistake.
-- **One import per file and table.** Before reading the checkpoint, the Postgres sink takes a session-level advisory lock keyed on `<table>:<absolute file path>`. A second import of the same file into the same table fails at once with `ImportInProgressError` (exit code 75). The lock is released when the import closes its connection, or by Postgres when the process dies.
+- **One import per file and table.** Before reading the checkpoint, the Postgres sink takes a session-level advisory lock keyed on `<table>:<absolute file path>`. A second import of the same file into the same table fails at once with `ImportInProgressError` (exit code 75). The lock is released when the import closes its connection, or by Postgres when the process dies. The lock exists only for Postgres: two concurrent SQLite imports of the same file would share the checkpoint and rejects files, so don't run them at the same time.
 - **Retries.** A batch that Postgres rolls back with `40001` (serialization failure) or `40P01` (deadlock) is retried, up to 3 attempts in total, with exponential backoff and full jitter. A lost connection is not retried in the same process, because the lock and the temp table die with the session: the import fails, and running it again resumes from the checkpoint. If `ROLLBACK` itself fails, the original error is reported (the rollback error is attached as `rollbackError`).
 - **Schema.** The sink creates `transactions` and `import_checkpoints` itself with `CREATE TABLE IF NOT EXISTS`, behind a global transaction-level advisory lock, because `IF NOT EXISTS` can still fail when two sessions create the same table at once. The database user therefore needs `CREATE` privilege on the schema, and `TEMPORARY` privilege on the database for the per-session `staging` temp table (granted to `PUBLIC` by default).
 - The sink keeps a no-op `'error'` listener on its client, so a connection the server drops between queries makes the next query fail instead of crashing the process.
@@ -258,6 +264,8 @@ With every batch the importer records a checkpoint: the byte offset, line count,
 
 - **Postgres** stores it as `jsonb` in the `import_checkpoints` table, keyed on `<table>:<absolute file path>`, and upserts it in the **same transaction** as the batch. The rows and the checkpoint commit together or not at all, so a resumed import never writes a batch twice. `--checkpoint` is ignored. The row is deleted once the whole file has been imported.
 - **SQLite** writes it to the `--checkpoint` file after the batch commits ([src/checkpoint.ts](src/checkpoint.ts)), via a temp file and a rename, so a crash never leaves a corrupt checkpoint behind.
+
+**Upgrading:** a Postgres import interrupted with an older version, which only wrote the checkpoint file, restarts from the first row with this version. That is safe, because the sink skips rows it already has, but it redoes the work.
 
 How resume stays correct:
 
