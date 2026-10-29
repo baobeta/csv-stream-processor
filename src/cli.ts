@@ -68,19 +68,28 @@ function printProgress(p: ImportProgress): void {
 
 // Ctrl+C (SIGINT) and container stops (SIGTERM) stop reading cleanly: pipeline() tears down
 // every stage and the sink keeps only fully committed batches; the next run resumes from there.
-const SHUTDOWN_GRACE_MS = 30_000;
+// Must stay below the orchestrator's grace period (Kubernetes defaults to 30 s), or SIGKILL wins.
+const SHUTDOWN_GRACE_MS = 10_000;
 const controller = new AbortController();
 let abortExitCode = 130;
 for (const [signal, exitCode] of [
   ['SIGINT', 130],
   ['SIGTERM', 143],
 ] as const) {
+  // A second, different signal is ignored so the first one's exit code and timer stand. The same
+  // signal twice is not caught (once) and falls through to Node's default kill: the user's escape hatch.
   process.once(signal, () => {
+    if (controller.signal.aborted) return;
     process.stderr.write(`\n${signal} received, stopping import...\n`);
     abortExitCode = exitCode;
     controller.abort();
     // The in-flight batch normally commits within a second; never hang a stop on a stuck query.
-    setTimeout(() => process.exit(exitCode), SHUTDOWN_GRACE_MS).unref();
+    setTimeout(() => {
+      process.stderr.write(
+        `Shutdown timed out after ${SHUTDOWN_GRACE_MS / 1000} s, forcing exit.\n`,
+      );
+      process.exit(exitCode);
+    }, SHUTDOWN_GRACE_MS).unref();
   });
 }
 
