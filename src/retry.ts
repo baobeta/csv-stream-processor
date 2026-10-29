@@ -1,4 +1,4 @@
-import { setTimeout } from 'node:timers/promises';
+import { setTimeout as sleep } from 'node:timers/promises';
 
 export interface RetryOptions {
   /** Total tries, including the first one. */
@@ -7,6 +7,7 @@ export interface RetryOptions {
   isRetryable: (error: unknown) => boolean;
 }
 
+/** Runs `work`, retrying with jittered exponential backoff while `isRetryable` accepts the error. */
 export async function withRetry<T>(work: () => Promise<T>, options: RetryOptions): Promise<T> {
   for (let attempt = 1; ; attempt++) {
     try {
@@ -14,7 +15,7 @@ export async function withRetry<T>(work: () => Promise<T>, options: RetryOptions
     } catch (error) {
       if (attempt >= options.attempts || !options.isRetryable(error)) throw error;
       // Exponential backoff with full jitter, so two conflicting importers don't retry in lockstep.
-      await setTimeout(Math.random() * options.baseDelayMs * 2 ** (attempt - 1));
+      await sleep(Math.random() * options.baseDelayMs * 2 ** (attempt - 1));
     }
   }
 }

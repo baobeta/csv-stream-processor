@@ -122,7 +122,9 @@ export class PostgresSink implements RowSink {
     const path = await withRetry(() => this.#writeTransaction(csv, checkpoint), {
       attempts: 3,
       baseDelayMs: 100,
-      isRetryable: (error) => RETRYABLE.has(pgCode(error) ?? ''),
+      // A failed ROLLBACK leaves the session state unknown (e.g. a dead connection): don't retry.
+      isRetryable: (error) =>
+        RETRYABLE.has(pgCode(error) ?? '') && !(error as { rollbackError?: unknown }).rollbackError,
     });
     // Counted after COMMIT, so a rolled-back attempt is never counted.
     this.stats[path === 'direct' ? 'directBatches' : 'mergedBatches']++;

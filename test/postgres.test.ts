@@ -1,5 +1,5 @@
 import pg from 'pg';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { Checkpoint } from '../src/checkpoint.ts';
 import { PostgresSink } from '../src/sinks/postgres.ts';
 import { ImportInProgressError } from '../src/sinks/types.ts';
@@ -197,6 +197,83 @@ describe.skipIf(!databaseUrl)('PostgresSink', () => {
       await admin.end();
       await sink.close().catch(() => {});
     }
+  });
+
+  describe('retrying a rolled-back batch', () => {
+    const retryTable = `${table}_retry`;
+    const seq = `${retryTable}_attempts`;
+    const fn = `${retryTable}_fail`;
+    let admin: pg.Client;
+    let sink: PostgresSink;
+
+    beforeEach(async () => {
+      sink = new PostgresSink(databaseUrl!, { table: retryTable });
+      await sink.open();
+      admin = new pg.Client({ connectionString: databaseUrl });
+      await admin.connect();
+      await admin.query(`CREATE SEQUENCE ${seq}`);
+    });
+
+    afterEach(async () => {
+      await sink.close();
+      await admin.query(`DROP TABLE IF EXISTS ${retryTable}`);
+      await admin.query(`DROP FUNCTION IF EXISTS ${fn}()`);
+      await admin.query(`DROP SEQUENCE IF EXISTS ${seq}`);
+      await admin.end();
+      await dropTable(retryTable);
+    });
+
+    /**
+     * Makes the first `failures` inserts raise `code`. Sequences are not rolled back, so the
+     * sequence counts attempts across ROLLBACKs. nextval runs per row: tests use single-row
+     * batches so one row is one attempt.
+     */
+    const failFirst = async (failures: number, code: string): Promise<void> => {
+      await admin.query(`
+        CREATE FUNCTION ${fn}() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          IF nextval('${seq}') <= ${failures} THEN
+            RAISE EXCEPTION 'forced' USING ERRCODE = '${code}';
+          END IF;
+          RETURN NEW;
+        END $$`);
+      await admin.query(
+        `CREATE TRIGGER force_failure BEFORE INSERT ON ${retryTable}
+         FOR EACH ROW EXECUTE FUNCTION ${fn}()`,
+      );
+    };
+
+    const attempts = async (): Promise<number> => {
+      const { rows } = await admin.query<{ n: string }>(
+        `SELECT CASE WHEN is_called THEN last_value ELSE 0 END AS n FROM ${seq}`,
+      );
+      return Number(rows[0]!.n);
+    };
+
+    it('retries a serialization failure and then commits batch and checkpoint', async () => {
+      await failFirst(2, '40001');
+      await sink.writeBatch([tx(1)], checkpointAt(1));
+      expect(await attempts()).toBe(3);
+      expect(await sink.count()).toBe(1);
+      expect(await sink.checkpoints.load(FILE)).toEqual(checkpointAt(1));
+      expect(sink.stats).toEqual({ directBatches: 1, mergedBatches: 0 });
+    });
+
+    it('gives up after three attempts and leaves nothing behind', async () => {
+      await failFirst(100, '40001');
+      await expect(sink.writeBatch([tx(1)], checkpointAt(1))).rejects.toMatchObject({
+        code: '40001',
+      });
+      expect(await attempts()).toBe(3);
+      expect(await sink.count()).toBe(0);
+      expect(await sink.checkpoints.load(FILE)).toBeUndefined();
+    });
+
+    it('does not retry other errors', async () => {
+      await failFirst(100, '22023');
+      await expect(sink.writeBatch([tx(1)])).rejects.toMatchObject({ code: '22023' });
+      expect(await attempts()).toBe(1);
+    });
   });
 
   it('rejects table names that are not plain identifiers', () => {
