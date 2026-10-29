@@ -12,6 +12,7 @@ import { pipeline } from 'node:stream/promises';
 import { parse, type Parser } from 'csv-parse';
 import { clearCheckpoint, loadCheckpoint, saveCheckpoint, type Checkpoint } from './checkpoint.ts';
 import { batch } from './pipeline/batch.ts';
+import { checkHeader } from './pipeline/header.ts';
 import type { ErrorPolicy, ImportCounters } from './pipeline/error-policy.ts';
 import { validateRows, type StreamPosition } from './pipeline/validate.ts';
 import type { RowSink } from './sinks/types.ts';
@@ -114,8 +115,9 @@ export async function importCsv(options: ImportOptions): Promise<ImportResult> {
     await pipeline(
       input,
       parse({
-        // A resumed read starts after the header, so reuse the header saved in the checkpoint.
-        columns: resumeFrom ? resumeFrom.columns : true,
+        // A resumed read starts after the header, so reuse the header saved in the checkpoint
+        // (it was checked on the first run). csv-parse rethrows checkHeader's error unchanged.
+        columns: resumeFrom ? resumeFrom.columns : checkHeader,
         bom: true,
         skip_empty_lines: true,
         trim: true,
