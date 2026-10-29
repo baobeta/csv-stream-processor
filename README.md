@@ -2,6 +2,8 @@
 
 A learning project for importing multi-gigabyte CSV files (for example 2 GB, about 16 million rows) in Node.js with **constant memory**. It covers streams, backpressure, validation, batching, transactional database writes, invalid-row handling, and resuming after an interruption. Every design decision is backed by real measurements.
 
+**How does it compare with popular libraries and Postgres's own loader, and why is it built this way?** See [docs/design-and-benchmarks.md](docs/design-and-benchmarks.md): a plain-language summary followed by benchmarks against `papaparse`, `csv-parser`, `fast-csv`, `psql \copy` and common `INSERT` approaches, plus one decision record per design choice.
+
 ## Contents
 
 - [What you will learn](#what-you-will-learn)
@@ -68,17 +70,18 @@ Press **Ctrl+C** to stop safely, then run **the same command** again to continue
 
 ### Scripts
 
-| Command          | What it does                                                      |
-| ---------------- | ----------------------------------------------------------------- |
-| `pnpm generate`  | Generate a test CSV file                                          |
-| `pnpm import`    | Import a CSV file                                                 |
-| `pnpm bench`     | Run the same file through several configurations and compare them |
-| `pnpm db:up`     | Start Postgres 17 in Docker (port 5544)                           |
-| `pnpm db:down`   | Stop Postgres                                                     |
-| `pnpm test`      | Run the tests (Vitest)                                            |
-| `pnpm typecheck` | `tsc --noEmit`                                                    |
-| `pnpm lint`      | ESLint                                                            |
-| `pnpm format`    | Prettier                                                          |
+| Command                | What it does                                                                               |
+| ---------------------- | ------------------------------------------------------------------------------------------ |
+| `pnpm generate`        | Generate a test CSV file                                                                   |
+| `pnpm import`          | Import a CSV file                                                                          |
+| `pnpm bench`           | Run the same file through several configurations and compare them                          |
+| `pnpm compare:parsers` | Compare this repo's parser with `papaparse`, `csv-parser`, `fast-csv` and naive approaches |
+| `pnpm db:up`           | Start Postgres 17 in Docker (port 5544)                                                    |
+| `pnpm db:down`         | Stop Postgres                                                                              |
+| `pnpm test`            | Run the tests (Vitest)                                                                     |
+| `pnpm typecheck`       | `tsc --noEmit`                                                                             |
+| `pnpm lint`            | ESLint                                                                                     |
+| `pnpm format`          | Prettier                                                                                   |
 
 ### `pnpm generate`
 
@@ -165,11 +168,15 @@ src/
   sinks/
     types.ts             # RowSink interface
     sqlite.ts            # direct / staging strategies
-    postgres.ts          # COPY → temp table → INSERT ON CONFLICT
+    postgres.ts          # COPY into the table; on duplicate ids, merge via temp table
     index.ts             # createSink() from configuration
 scripts/
   generate-csv.ts        # test data generator
   bench.ts               # multi-configuration benchmark
+  compare-parsers.ts     # this repo vs other CSV libraries
+  compare-loaders.ts     # this repo vs common Postgres loading approaches
+docs/
+  design-and-benchmarks.md  # comparisons and decision records
 test/                    # Vitest: unit, integration, resume, Postgres
 compose.yaml             # Postgres 17 for development
 ```
@@ -202,13 +209,13 @@ Sink lifecycle: `open` → `writeBatch` (many times) → `finish` (only when the
 
 ## Sinks
 
-| Sink               | How it writes                                                                                                                      | When to use                            |
-| ------------------ | ---------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------- |
-| **SQLite direct**  | `INSERT ... ON CONFLICT DO NOTHING` straight into the table with the primary key                                                   | Ordered keys (UUID v7, auto-increment) |
-| **SQLite staging** | Append to an index-free table; `finish()` merges everything once with `INSERT ... SELECT ... ORDER BY id`                          | Random keys (UUID v4)                  |
-| **Postgres**       | Per batch: `COPY` into a temp table (`ON COMMIT DELETE ROWS`) → `INSERT ... SELECT ... ON CONFLICT DO NOTHING`, in one transaction | Production                             |
+| Sink               | How it writes                                                                                                                                                                       | When to use                            |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------- |
+| **SQLite direct**  | `INSERT ... ON CONFLICT DO NOTHING` straight into the table with the primary key                                                                                                    | Ordered keys (UUID v7, auto-increment) |
+| **SQLite staging** | Append to an index-free table; `finish()` merges everything once with `INSERT ... SELECT ... ORDER BY id`                                                                           | Random keys (UUID v4)                  |
+| **Postgres**       | Per batch: `COPY` straight into the table inside a savepoint; only if an id already exists, roll back to the savepoint and merge through a temp table with `ON CONFLICT DO NOTHING` | Production                             |
 
-- `COPY` is the fastest way to bulk-load Postgres, but it cannot skip duplicates, so rows first go through an index-free temp table.
+- `COPY` is the fastest way to bulk-load Postgres, but it cannot skip duplicates. Duplicates only appear when a batch is replayed after a crash or a file is re-imported, so the common case takes the plain `COPY` path. Always merging through the temp table was 2.5× slower ([details](docs/design-and-benchmarks.md#a-bug-the-benchmark-found)); `sink.stats` reports how many batches took each path.
 - When escaping CSV for `COPY`, empty strings must be quoted (`""`), because `COPY ... (FORMAT csv)` reads an unquoted empty field as `NULL`.
 - Staging: on resume the staging table is kept; on a fresh run it is cleared, so leftovers from an abandoned run are never merged by mistake.
 
@@ -237,38 +244,38 @@ After every committed batch, [src/checkpoint.ts](src/checkpoint.ts) saves the by
 - **Counters are restored**, so `--max-invalid` applies to the _whole file_, not to each run.
 - **Trap 2: duplicate rejects.** Invalid rows after the checkpoint were already written by the previous run, and are read and rejected again on resume. The database is fine thanks to idempotency, but the rejects file is not. The fix: store the rejects file's size in the checkpoint and truncate the file back to it on resume. Invalid rows are written synchronously (`writeSync`); they are rare, and this keeps the size on disk in step with the checkpoint. [test/resume.test.ts](test/resume.test.ts) caught this bug.
 
-Verified end-to-end against Postgres on a 2.45-million-row file: Ctrl+C at 510,000 rows → run again → all 2,453,511 rows present, no duplicate ids, no duplicate rejects, and the resumed run took 48 s versus 57 s for a full run.
+Verified end-to-end against Postgres on a 2.45-million-row file: Ctrl+C at 700,000 rows (the database and the checkpoint agree) → run again → all 2,453,500 valid rows present, 2,453,500 distinct ids, and 2,500 rejects with no duplicate lines.
 
 ## Benchmarks
 
-300 MB file, 2,456,000 rows (0.1% invalid), MacBook, Postgres 17 in Docker, measured with `pnpm bench`. Treat the numbers as relative; other machines will differ.
+300 MB file, 2,456,000 rows (0.1% invalid), MacBook, Postgres 17 in Docker, measured with `pnpm bench`. Treat the numbers as relative: other machines differ, and Docker's disk speed drifted by ~2.5× between sessions, so only numbers from the same session are compared. The Postgres numbers come from a later session than the SQLite ones (after the sink fix); `psql \copy` took 36.2 s in that session. Comparisons with other libraries and loaders are in [docs/design-and-benchmarks.md](docs/design-and-benchmarks.md).
 
 ### Write strategy × ID format (batch size 5000)
 
-| Sink           | UUID v4 (random)   | UUID v7 (time-ordered) |
-| -------------- | ------------------ | ---------------------- |
-| SQLite direct  | 122 s (20k rows/s) | **17 s** (144k rows/s) |
-| SQLite staging | 21 s (115k rows/s) | —                      |
-| Postgres COPY  | 57 s (43k rows/s)  | 54 s (45k rows/s)      |
+| Sink           | UUID v4 (random)    | UUID v7 (time-ordered) |
+| -------------- | ------------------- | ---------------------- |
+| SQLite direct  | 122 s (20k rows/s)  | **17 s** (144k rows/s) |
+| SQLite staging | 21 s (115k rows/s)  | —                      |
+| Postgres COPY  | 37.4 s (66k rows/s) | 30.9 s (80k rows/s)    |
 
 Peak heap stayed at 70–120 MB in every configuration, regardless of file size.
 
 - **The UUID v4 primary key is the culprit.** Each insert lands on a random B-tree page; once the index outgrows the page cache, almost every insert hits the disk. With SQLite's default cache (~2 MB) the same file took ~344 s; raising `cache_size` to 64 MB brought it to 122 s.
 - **Staging** turns random inserts into one sorted merge, so the B-tree is written in key order.
 - **UUID v7** gets the same effect without a merge step: new keys are always larger than old ones, so inserts only append to the B-tree's rightmost page. Node 24 has no `crypto.randomUUIDv7()` yet; see [src/uuid.ts](src/uuid.ts).
-- **Postgres barely changes between v4 and v7** at this scale: the uuid index for 2.4 million rows (an estimated ~75 MB) still fits in the default 128 MB `shared_buffers`. The gap should appear once the index outgrows the buffer cache.
+- **Postgres gains less from v7 (~17%)** than SQLite at this scale: the uuid index for 2.4 million rows (an estimated ~75 MB) still fits in the default 128 MB `shared_buffers`. The gap should grow once the index outgrows the buffer cache.
 - Without an index, the read-parse-validate pipeline handles 300 MB in about 17 s. The bottleneck is the database, not the stream.
 
 ### Batch size (UUID v4)
 
-| Batch size | Postgres COPY      | SQLite staging     |
-| ---------- | ------------------ | ------------------ |
-| 100        | 103 s (24k rows/s) | 21 s (118k rows/s) |
-| 1000       | 61 s (40k rows/s)  | 21 s (118k rows/s) |
-| 5000       | 58 s (42k rows/s)  | 21 s (116k rows/s) |
-| 20000      | 73 s (33k rows/s)  | 22 s (110k rows/s) |
+| Batch size | Postgres COPY        | SQLite staging     |
+| ---------- | -------------------- | ------------------ |
+| 100        | 136.5 s (18k rows/s) | 21 s (118k rows/s) |
+| 1000       | 52.3 s (47k rows/s)  | 21 s (118k rows/s) |
+| 5000       | 37.4 s (66k rows/s)  | 21 s (116k rows/s) |
+| 20000      | 44.2 s (56k rows/s)  | 22 s (110k rows/s) |
 
-- **Postgres shows a U-shaped curve.** With small batches, every 100 rows pay four network round-trips (`BEGIN`, `COPY`, `INSERT`, `COMMIT`). With very large batches, peak heap grows (167 MB at 20,000) and each bigger transaction gets slower. The sweet spot is around 1000–5000.
+- **Postgres shows a U-shaped curve.** With small batches, every 100 rows pay four network round-trips (`BEGIN`, `SAVEPOINT`, `COPY`, `COMMIT`). With very large batches, peak heap grows (107–112 MB up to 5000, 145 MB at 20,000) and each bigger transaction gets slower. The sweet spot is around 5000.
 - **SQLite barely cares about batch size**: it runs in-process with no network, and with WAL + `synchronous = NORMAL` each commit is cheap.
 - There is no universally "right" batch size. It depends on each sink's fixed cost per write, so measure instead of guessing.
 
@@ -279,14 +286,14 @@ pnpm test           # run once
 pnpm test:watch     # watch mode
 ```
 
-| File                                                   | What it checks                                                                                        |
-| ------------------------------------------------------ | ----------------------------------------------------------------------------------------------------- |
-| [test/import.test.ts](test/import.test.ts)             | Tricky CSV (quotes, commas, line breaks, BOM), batching, rejects, aborting past the limit             |
-| [test/resume.test.ts](test/resume.test.ts)             | Crash → resume: every row written exactly once, absolute reject line numbers, `--fresh`, changed file |
-| [test/sqlite.test.ts](test/sqlite.test.ts)             | direct / staging, duplicate skipping, keeping or clearing staging                                     |
-| [test/postgres.test.ts](test/postgres.test.ts)         | `COPY`, duplicates, empty strings not becoming `NULL`, rejecting invalid table names                  |
-| [test/error-policy.test.ts](test/error-policy.test.ts) | Invalid-row limit, failing fast when `maxInvalidRows = 0`                                             |
-| `schema`, `batch`, `csv`, `uuid`                       | Unit tests                                                                                            |
+| File                                                   | What it checks                                                                                                               |
+| ------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------- |
+| [test/import.test.ts](test/import.test.ts)             | Tricky CSV (quotes, commas, line breaks, BOM), batching, rejects, aborting past the limit                                    |
+| [test/resume.test.ts](test/resume.test.ts)             | Crash → resume: every row written exactly once, absolute reject line numbers, `--fresh`, changed file                        |
+| [test/sqlite.test.ts](test/sqlite.test.ts)             | direct / staging, duplicate skipping, keeping or clearing staging                                                            |
+| [test/postgres.test.ts](test/postgres.test.ts)         | `COPY` fast path and duplicate fallback, duplicates inside one batch, empty strings not becoming `NULL`, invalid table names |
+| [test/error-policy.test.ts](test/error-policy.test.ts) | Invalid-row limit, failing fast when `maxInvalidRows = 0`                                                                    |
+| `schema`, `batch`, `csv`, `uuid`                       | Unit tests                                                                                                                   |
 
 The Postgres tests only run when `DATABASE_URL` is set; it is loaded from `.env` by [vitest.config.ts](vitest.config.ts). Otherwise they are skipped. Each run uses its own throwaway table and drops it afterwards.
 

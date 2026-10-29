@@ -25,6 +25,8 @@ describe.skipIf(!databaseUrl)('PostgresSink', () => {
       ]);
       await sink.writeBatch([tx(2), tx(3)]);
       expect(await sink.count()).toBe(3);
+      // First batch is new (fast path); second contains the stored id 2 (merge path).
+      expect(sink.stats).toEqual({ directBatches: 1, mergedBatches: 1 });
     } finally {
       await sink.close();
     }
@@ -40,6 +42,23 @@ describe.skipIf(!databaseUrl)('PostgresSink', () => {
       { description: '', amount: 100 },
       { description: 'Coffee', amount: 100 },
     ]);
+  });
+
+  it('falls back to the merge for a duplicate id inside one batch, keeping the batch atomic', async () => {
+    const dupTable = `${table}_dup`;
+    const sink = new PostgresSink(databaseUrl!, { table: dupTable });
+    await sink.open();
+    try {
+      await sink.writeBatch([tx(10), tx(11), tx(10)]);
+      expect(await sink.count()).toBe(2);
+      expect(sink.stats).toEqual({ directBatches: 0, mergedBatches: 1 });
+    } finally {
+      await sink.close();
+      const client = new pg.Client({ connectionString: databaseUrl });
+      await client.connect();
+      await client.query(`DROP TABLE IF EXISTS ${dupTable}`);
+      await client.end();
+    }
   });
 
   it('rejects table names that are not plain identifiers', () => {
