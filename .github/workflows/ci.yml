@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: csv
+          POSTGRES_PASSWORD: csv
+          POSTGRES_DB: csv_import
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U csv -d csv_import"
+          --health-interval 2s
+          --health-retries 15
+    env:
+      DATABASE_URL: postgres://csv:csv@localhost:5432/csv_import
+    steps:
+      - uses: actions/checkout@v4
+      # Reads the pnpm version from "packageManager" in package.json.
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - run: pnpm exec prettier --check .
+      - run: pnpm test

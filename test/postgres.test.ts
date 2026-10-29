@@ -6,6 +6,8 @@ import { ImportInProgressError } from '../src/sinks/types.ts';
 import { tx } from './helpers.ts';
 
 const databaseUrl = process.env.DATABASE_URL;
+// Locally these tests skip without a database; in CI a skip would hide a broken setup.
+if (process.env.CI && !databaseUrl) throw new Error('DATABASE_URL must be set in CI');
 const table = `test_transactions_${process.pid}`;
 const FILE = '/data/a.csv';
 const checkpointAt = (written: number): Checkpoint => ({
