@@ -2,6 +2,7 @@ import pg from 'pg';
 import { afterAll, describe, expect, it } from 'vitest';
 import type { Checkpoint } from '../src/checkpoint.ts';
 import { PostgresSink } from '../src/sinks/postgres.ts';
+import { ImportInProgressError } from '../src/sinks/types.ts';
 import { tx } from './helpers.ts';
 
 const databaseUrl = process.env.DATABASE_URL;
@@ -134,6 +135,45 @@ describe.skipIf(!databaseUrl)('PostgresSink', () => {
         await Promise.all(sinks.map((s) => s.close()));
         await dropTable(raceTable);
       }
+    }
+  });
+
+  it('lets only one import of a file run at a time', async () => {
+    const first = new PostgresSink(databaseUrl!, { table });
+    const second = new PostgresSink(databaseUrl!, { table });
+    try {
+      await first.lock(FILE);
+      await expect(second.lock(FILE)).rejects.toBeInstanceOf(ImportInProgressError);
+      await second.lock('/data/other.csv');
+    } finally {
+      await first.close();
+      await second.close();
+    }
+
+    // Closing the connection released the lock.
+    const third = new PostgresSink(databaseUrl!, { table });
+    try {
+      await third.lock(FILE);
+    } finally {
+      await third.close();
+    }
+  });
+
+  it('survives the server dropping the connection and fails the next query instead', async () => {
+    const sink = new PostgresSink(databaseUrl!, { table });
+    const admin = new pg.Client({ connectionString: databaseUrl });
+    await admin.connect();
+    try {
+      await sink.lock(FILE);
+      const { rows } = await admin.query<{ pid: number }>(
+        "SELECT pid FROM pg_stat_activity WHERE application_name = 'csv-stream-processor' AND pid <> pg_backend_pid()",
+      );
+      for (const { pid } of rows) await admin.query('SELECT pg_terminate_backend($1)', [pid]);
+      await new Promise((r) => setTimeout(r, 100));
+      await expect(sink.count()).rejects.toThrow();
+    } finally {
+      await admin.end();
+      await sink.close().catch(() => {});
     }
   });
 

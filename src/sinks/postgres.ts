@@ -5,7 +5,12 @@ import { from as copyFrom } from 'pg-copy-streams';
 import type { Checkpoint } from '../checkpoint.ts';
 import { csvLine } from '../csv.ts';
 import type { Transaction } from '../schema.ts';
-import { TRANSACTION_COLUMNS, type CheckpointStore, type RowSink } from './types.ts';
+import {
+  ImportInProgressError,
+  TRANSACTION_COLUMNS,
+  type CheckpointStore,
+  type RowSink,
+} from './types.ts';
 
 const COLUMNS = TRANSACTION_COLUMNS.join(', ');
 
@@ -71,6 +76,19 @@ export class PostgresSink implements RowSink {
     if (!/^[a-z_][a-z0-9_]*$/.test(table)) throw new Error(`invalid table name: ${table}`);
     this.#table = table;
     this.#client = new pg.Client({ connectionString, application_name: 'csv-stream-processor' });
+    // Without a listener, a connection dropped by the server between queries crashes the process.
+    // The next query rejects with a clear error instead, the import fails, and a rerun resumes.
+    this.#client.on('error', () => {});
+  }
+
+  async lock(key: string): Promise<void> {
+    await this.#connect();
+    // Session-level lock: released by close(), or by Postgres when the process dies.
+    const { rows } = await this.#client.query<{ locked: boolean }>(
+      'SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked',
+      [this.#key(key)],
+    );
+    if (!rows[0]!.locked) throw new ImportInProgressError(key);
   }
 
   async open(): Promise<void> {
@@ -154,7 +172,7 @@ export class PostgresSink implements RowSink {
     if (this.#connected) await this.#client.end();
   }
 
-  /** Connects once, from whichever of checkpoints.load / checkpoints.clear / open runs first. */
+  /** Connects once, from whichever of lock / checkpoints.load / checkpoints.clear / open runs first. */
   #connect(): Promise<void> {
     this.#connected ??= (async () => {
       await this.#client.connect();
