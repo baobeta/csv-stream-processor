@@ -125,5 +125,9 @@ try {
     process.exitCode = 1;
   }
 } finally {
-  await sink.close();
+  // A failed close must not turn into an unhandled rejection that replaces the exit code above.
+  // Called inside then() so a synchronous throw (SQLite's close() is sync) is caught as well.
+  await Promise.resolve()
+    .then(() => sink.close())
+    .catch((error: unknown) => console.error('Closing the sink failed:', error));
 }
