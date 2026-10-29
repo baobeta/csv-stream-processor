@@ -1,0 +1,12 @@
+node_modules/
+dist/
+coverage/
+
+# Generated datasets, databases and reject logs can be gigabytes - never commit them
+data/*
+!data/.gitkeep
+
+.env
+.DS_Store
+*.log
+.omc/

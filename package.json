@@ -1,0 +1,40 @@
+{
+  "name": "csv-stream-processor",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Learning project: import multi-GB CSV files in Node.js with streams, backpressure and batching",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "packageManager": "pnpm@9.15.0",
+  "scripts": {
+    "db:up": "docker compose up -d --wait",
+    "db:down": "docker compose down",
+    "generate": "node scripts/generate-csv.ts",
+    "import": "node --env-file-if-exists=.env --disable-warning=ExperimentalWarning src/cli.ts",
+    "bench": "node --env-file-if-exists=.env --disable-warning=ExperimentalWarning scripts/bench.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "format": "prettier --write ."
+  },
+  "dependencies": {
+    "csv-parse": "^7.0.3",
+    "pg": "^8.23.1",
+    "pg-copy-streams": "^7.0.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^24.0.0",
+    "@types/pg": "^8.23.1",
+    "@types/pg-copy-streams": "^1.2.5",
+    "eslint": "^10.13.0",
+    "prettier": "^3.9.10",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.72.1",
+    "vitest": "^5.0.5"
+  }
+}
