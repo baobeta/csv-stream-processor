@@ -1,6 +1,6 @@
 import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { importCsv, type ImportOptions } from '../src/import.ts';
 import type { Checkpoint } from '../src/checkpoint.ts';
@@ -51,7 +51,7 @@ class TransactionalSink implements RowSink {
   }
   writeBatch(rows: Transaction[], checkpoint?: Checkpoint) {
     for (const r of rows) this.writes.set(r.id, (this.writes.get(r.id) ?? 0) + 1);
-    if (checkpoint) this.saved.set(checkpoint.filePath, checkpoint);
+    if (checkpoint) this.saved.set(checkpoint.filePath, structuredClone(checkpoint));
     if (++this.#batches === this.#crashAfterBatch) throw new Error('crash after commit');
   }
   close() {}
@@ -131,6 +131,7 @@ describe('resume from checkpoint', () => {
       importCsv({ ...base, sink: new TransactionalSink(writes, saved, 3) }),
     ).rejects.toThrow('crash after commit');
     expect(writes.size).toBe(9);
+    expect(saved.get(resolve(base.filePath))).toMatchObject({ counters: { written: 9 } });
 
     const result = await importCsv({ ...base, sink: new TransactionalSink(writes, saved) });
 
@@ -140,6 +141,15 @@ describe('resume from checkpoint', () => {
     expect(saved.size).toBe(0);
     // The sink owns the checkpoint, so no file is written.
     expect(await exists(base.checkpoint!.path)).toBe(false);
+
+    const rejects = (await readFile(base.rejectsPath, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((l) => JSON.parse(l));
+    expect(rejects.map((r) => [r.line, r.raw.id])).toEqual([
+      [6, uuid(100)],
+      [12, uuid(101)],
+    ]);
   });
 
   it('starts from the first row when fresh is set', async () => {

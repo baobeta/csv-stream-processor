@@ -28,17 +28,27 @@ export class ImportInProgressError extends Error {
  * Lifecycle: lock → open → writeBatch* → finish (only if the whole file was imported) → close.
  */
 export interface RowSink {
-  /** Guarantees a single running import per key on this destination; held until close(). */
+  /**
+   * Guarantees a single running import per key on this destination (scoped to this sink's
+   * destination plus `key`). Released by close(), which the caller of importCsv must call even
+   * when lock() throws.
+   */
   lock?(key: string): Promise<void>;
   open?(context: SinkOpenContext): void | Promise<void>;
   /**
    * `checkpoint` is only passed to sinks that have `checkpoints`: they must commit it in the
    * same transaction as `rows`, so progress can never lag behind (or run ahead of) the data.
+   * It is `undefined` when checkpointing is disabled for this import; when present it must be
+   * persisted in the same transaction.
    */
   writeBatch(rows: Transaction[], checkpoint?: Checkpoint): void | Promise<void>;
   finish?(): void | Promise<void>;
   close(): void | Promise<void>;
   count?(): number | Promise<number>;
+  /**
+   * `lock` and `checkpoints.load` run BEFORE `open()`, so they must work before the destination
+   * schema exists (e.g. load returns undefined). `clear` runs after `finish()`.
+   */
   checkpoints?: CheckpointStore;
 }
 

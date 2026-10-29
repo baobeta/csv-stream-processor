@@ -97,6 +97,7 @@ export async function importCsv(options: ImportOptions): Promise<ImportResult> {
     },
   };
 
+  const checkpointPath = options.checkpoint?.path;
   const startedAtMs = performance.now();
   const reportProgress = () =>
     options.onProgress?.({
@@ -150,7 +151,7 @@ export async function importCsv(options: ImportOptions): Promise<ImportResult> {
             await sink.writeBatch(rows);
             // Saved only after the batch is committed. A crash between commit and save replays
             // one batch on resume, which the idempotent sink absorbs (at-least-once + idempotent).
-            if (checkpoint) await saveCheckpoint(options.checkpoint!.path, checkpoint);
+            if (checkpoint && checkpointPath) await saveCheckpoint(checkpointPath, checkpoint);
           }
           counters.written += rows.length;
         }
