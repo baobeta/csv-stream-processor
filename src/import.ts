@@ -15,7 +15,7 @@ import { batch } from './pipeline/batch.ts';
 import { checkHeader } from './pipeline/header.ts';
 import type { ErrorPolicy, ImportCounters } from './pipeline/error-policy.ts';
 import { validateRows, type StreamPosition } from './pipeline/validate.ts';
-import type { RowSink } from './sinks/types.ts';
+import type { CheckpointStore, RowSink } from './sinks/types.ts';
 
 export interface ImportOptions {
   filePath: string;
@@ -26,6 +26,7 @@ export interface ImportOptions {
   /**
    * Save progress after every committed batch and continue from it on the next run.
    * `target` identifies the destination so a checkpoint is never applied to another database.
+   * `path` is only used when the sink has no `checkpoints` store of its own.
    */
   checkpoint?: { path: string; target: string };
   /** Ignore an existing checkpoint and start from the first row. */
@@ -64,7 +65,9 @@ export async function importCsv(options: ImportOptions): Promise<ImportResult> {
     fileMtimeMs: file.mtimeMs,
     target: options.checkpoint?.target ?? '',
   };
-  const resumeFrom = await findResumableCheckpoint(options, identity);
+  // Locked before the checkpoint is read, so two workers can never resume from the same one.
+  await sink.lock?.(identity.filePath);
+  const resumeFrom = await findResumableCheckpoint(options, identity, sink.checkpoints);
 
   const counters: ImportCounters = resumeFrom
     ? { ...resumeFrom.counters }
@@ -132,27 +135,35 @@ export async function importCsv(options: ImportOptions): Promise<ImportResult> {
       (source) => batch(source, batchSize),
       async (source) => {
         for await (const rows of source) {
-          await sink.writeBatch(rows);
-          counters.written += rows.length;
-          // Saved only after the batch is committed. A crash between commit and save replays
-          // one batch on resume, which the idempotent sink absorbs (at-least-once + idempotent).
-          if (options.checkpoint) {
-            await saveCheckpoint(options.checkpoint.path, {
-              ...identity,
-              columns: position.columns ?? [],
-              bytes: position.bytes,
-              lines: position.lines,
-              rejectsBytes,
-              counters: { ...counters },
-            });
+          const checkpoint: Checkpoint | undefined = options.checkpoint && {
+            ...identity,
+            columns: position.columns ?? [],
+            bytes: position.bytes,
+            lines: position.lines,
+            rejectsBytes,
+            counters: { ...counters, written: counters.written + rows.length },
+          };
+          if (sink.checkpoints) {
+            // Committed atomically with the rows: a crash can no longer replay this batch.
+            await sink.writeBatch(rows, checkpoint);
+          } else {
+            await sink.writeBatch(rows);
+            // Saved only after the batch is committed. A crash between commit and save replays
+            // one batch on resume, which the idempotent sink absorbs (at-least-once + idempotent).
+            if (checkpoint) await saveCheckpoint(options.checkpoint!.path, checkpoint);
           }
+          counters.written += rows.length;
         }
       },
       { signal: options.signal },
     );
 
     await sink.finish?.();
-    if (options.checkpoint) await clearCheckpoint(options.checkpoint.path);
+    if (options.checkpoint) {
+      await (sink.checkpoints
+        ? sink.checkpoints.clear(identity.filePath)
+        : clearCheckpoint(options.checkpoint.path));
+    }
     reportProgress();
   } finally {
     clearInterval(timer);
@@ -169,9 +180,12 @@ export async function importCsv(options: ImportOptions): Promise<ImportResult> {
 async function findResumableCheckpoint(
   options: ImportOptions,
   identity: Pick<Checkpoint, 'filePath' | 'fileSize' | 'fileMtimeMs' | 'target'>,
+  store: CheckpointStore | undefined,
 ): Promise<Checkpoint | undefined> {
   if (!options.checkpoint || options.fresh) return undefined;
-  const saved = await loadCheckpoint(options.checkpoint.path);
+  const saved = store
+    ? await store.load(identity.filePath)
+    : await loadCheckpoint(options.checkpoint.path);
   // A checkpoint for a different or modified file (or another database) would point at
   // meaningless byte offsets, so it is ignored and overwritten by this run.
   const matches =
