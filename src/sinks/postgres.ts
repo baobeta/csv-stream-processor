@@ -4,6 +4,7 @@ import pg from 'pg';
 import { from as copyFrom } from 'pg-copy-streams';
 import type { Checkpoint } from '../checkpoint.ts';
 import { csvLine } from '../csv.ts';
+import { withRetry } from '../retry.ts';
 import type { Transaction } from '../schema.ts';
 import {
   ImportInProgressError,
@@ -27,6 +28,9 @@ const toCsvLine = (r: Transaction): string =>
 
 /** Postgres error code for a unique constraint violation. */
 const UNIQUE_VIOLATION = '23505';
+
+/** serialization_failure, deadlock_detected: Postgres rolled back, the same batch can be retried. */
+const RETRYABLE = new Set(['40001', '40P01']);
 
 const pgCode = (error: unknown): string | undefined => (error as { code?: string }).code;
 
@@ -113,7 +117,13 @@ export class PostgresSink implements RowSink {
   async writeBatch(rows: Transaction[], checkpoint?: Checkpoint): Promise<void> {
     // One chunk per batch rather than one per row: fewer CopyData messages on the wire.
     const csv = rows.map(toCsvLine).join('');
-    const path = await this.#writeTransaction(csv, checkpoint);
+    // Lost connections are deliberately not retried here: the advisory lock and the temp table die
+    // with the session, so the right recovery is to fail and let a rerun resume from the checkpoint.
+    const path = await withRetry(() => this.#writeTransaction(csv, checkpoint), {
+      attempts: 3,
+      baseDelayMs: 100,
+      isRetryable: (error) => RETRYABLE.has(pgCode(error) ?? ''),
+    });
     // Counted after COMMIT, so a rolled-back attempt is never counted.
     this.stats[path === 'direct' ? 'directBatches' : 'mergedBatches']++;
   }
