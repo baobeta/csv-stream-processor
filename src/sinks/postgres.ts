@@ -2,9 +2,10 @@ import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import pg from 'pg';
 import { from as copyFrom } from 'pg-copy-streams';
+import type { Checkpoint } from '../checkpoint.ts';
 import { csvLine } from '../csv.ts';
 import type { Transaction } from '../schema.ts';
-import { TRANSACTION_COLUMNS, type RowSink } from './types.ts';
+import { TRANSACTION_COLUMNS, type CheckpointStore, type RowSink } from './types.ts';
 
 const COLUMNS = TRANSACTION_COLUMNS.join(', ');
 
@@ -22,6 +23,8 @@ const toCsvLine = (r: Transaction): string =>
 /** Postgres error code for a unique constraint violation. */
 const UNIQUE_VIOLATION = '23505';
 
+const pgCode = (error: unknown): string | undefined => (error as { code?: string }).code;
+
 export interface PostgresSinkStats {
   /** Batches loaded with a plain COPY into the target table (the fast path). */
   directBatches: number;
@@ -37,21 +40,41 @@ export interface PostgresSinkStats {
  * batch rolled back to the savepoint and merged through a temp table with
  * `ON CONFLICT DO NOTHING`. Merging every batch that way was ~2.5x slower, because
  * ON CONFLICT checks each row speculatively even when there are no duplicates.
+ *
+ * Each batch also upserts its checkpoint into import_checkpoints before COMMIT, so a resumed
+ * import starts exactly after the last committed batch.
  */
 export class PostgresSink implements RowSink {
   readonly #client: pg.Client;
   readonly #table: string;
+  #connected: Promise<void> | undefined;
   readonly stats: PostgresSinkStats = { directBatches: 0, mergedBatches: 0 };
+
+  /** Checkpoints live next to the data, so `writeBatch` can commit both in one transaction. */
+  readonly checkpoints: CheckpointStore = {
+    load: async (key) => {
+      await this.#connect();
+      const { rows } = await this.#client.query<{ checkpoint: Checkpoint }>(
+        'SELECT checkpoint FROM import_checkpoints WHERE key = $1',
+        [this.#key(key)],
+      );
+      return rows[0]?.checkpoint;
+    },
+    clear: async (key) => {
+      await this.#connect();
+      await this.#client.query('DELETE FROM import_checkpoints WHERE key = $1', [this.#key(key)]);
+    },
+  };
 
   constructor(connectionString: string, { table = 'transactions' }: { table?: string } = {}) {
     // The table name is interpolated into SQL, so only allow plain identifiers.
     if (!/^[a-z_][a-z0-9_]*$/.test(table)) throw new Error(`invalid table name: ${table}`);
     this.#table = table;
-    this.#client = new pg.Client({ connectionString });
+    this.#client = new pg.Client({ connectionString, application_name: 'csv-stream-processor' });
   }
 
   async open(): Promise<void> {
-    await this.#client.connect();
+    await this.#connect();
     await this.#client.query(`
       CREATE TABLE IF NOT EXISTS ${this.#table} (
         id           uuid        PRIMARY KEY,
@@ -69,28 +92,46 @@ export class PostgresSink implements RowSink {
     );
   }
 
-  async writeBatch(rows: Transaction[]): Promise<void> {
+  async writeBatch(rows: Transaction[], checkpoint?: Checkpoint): Promise<void> {
     // One chunk per batch rather than one per row: fewer CopyData messages on the wire.
     const csv = rows.map(toCsvLine).join('');
+    const path = await this.#writeTransaction(csv, checkpoint);
+    // Counted after COMMIT, so a rolled-back attempt is never counted.
+    this.stats[path === 'direct' ? 'directBatches' : 'mergedBatches']++;
+  }
+
+  async #writeTransaction(csv: string, checkpoint?: Checkpoint): Promise<'direct' | 'merged'> {
     await this.#client.query('BEGIN');
     try {
-      await this.#client.query('SAVEPOINT direct_copy');
-      try {
-        await this.#copy(this.#table, csv);
-        this.stats.directBatches++;
-      } catch (error) {
-        if ((error as { code?: string }).code !== UNIQUE_VIOLATION) throw error;
-        await this.#client.query('ROLLBACK TO SAVEPOINT direct_copy');
-        await this.#copy('staging', csv);
+      const path = await this.#copyBatch(csv);
+      if (checkpoint) {
         await this.#client.query(
-          `INSERT INTO ${this.#table} (${COLUMNS}) SELECT ${COLUMNS} FROM staging ON CONFLICT (id) DO NOTHING`,
+          `INSERT INTO import_checkpoints (key, checkpoint) VALUES ($1, $2::jsonb)
+           ON CONFLICT (key) DO UPDATE SET checkpoint = excluded.checkpoint, updated_at = now()`,
+          [this.#key(checkpoint.filePath), JSON.stringify(checkpoint)],
         );
-        this.stats.mergedBatches++;
       }
       await this.#client.query('COMMIT');
+      return path;
     } catch (error) {
       await this.#client.query('ROLLBACK');
       throw error;
+    }
+  }
+
+  async #copyBatch(csv: string): Promise<'direct' | 'merged'> {
+    await this.#client.query('SAVEPOINT direct_copy');
+    try {
+      await this.#copy(this.#table, csv);
+      return 'direct';
+    } catch (error) {
+      if (pgCode(error) !== UNIQUE_VIOLATION) throw error;
+      await this.#client.query('ROLLBACK TO SAVEPOINT direct_copy');
+      await this.#copy('staging', csv);
+      await this.#client.query(
+        `INSERT INTO ${this.#table} (${COLUMNS}) SELECT ${COLUMNS} FROM staging ON CONFLICT (id) DO NOTHING`,
+      );
+      return 'merged';
     }
   }
 
@@ -109,6 +150,27 @@ export class PostgresSink implements RowSink {
   }
 
   async close(): Promise<void> {
-    await this.#client.end();
+    // The CLI closes the sink even when the import failed before connecting.
+    if (this.#connected) await this.#client.end();
+  }
+
+  /** Connects once, from whichever of lock / checkpoints.load / open runs first. */
+  #connect(): Promise<void> {
+    this.#connected ??= (async () => {
+      await this.#client.connect();
+      await this.#client.query(`
+        CREATE TABLE IF NOT EXISTS import_checkpoints (
+          key        text        PRIMARY KEY,
+          checkpoint jsonb       NOT NULL,
+          updated_at timestamptz NOT NULL DEFAULT now()
+        )
+      `);
+    })();
+    return this.#connected;
+  }
+
+  /** Includes the table, so imports of the same file into different tables don't collide. */
+  #key(filePath: string): string {
+    return `${this.#table}:${filePath}`;
   }
 }

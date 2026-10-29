@@ -1,10 +1,23 @@
 import pg from 'pg';
 import { afterAll, describe, expect, it } from 'vitest';
+import type { Checkpoint } from '../src/checkpoint.ts';
 import { PostgresSink } from '../src/sinks/postgres.ts';
 import { tx } from './helpers.ts';
 
 const databaseUrl = process.env.DATABASE_URL;
 const table = `test_transactions_${process.pid}`;
+const FILE = '/data/a.csv';
+const checkpointAt = (written: number): Checkpoint => ({
+  filePath: FILE,
+  fileSize: 1_000,
+  fileMtimeMs: 1_700_000_000_000.5,
+  target: 'test',
+  columns: ['id', 'amount'],
+  bytes: written * 10,
+  lines: written + 1,
+  rejectsBytes: 0,
+  counters: { processed: written, invalid: 0, written },
+});
 
 // Runs only when a database is configured (`pnpm db:up` + .env).
 describe.skipIf(!databaseUrl)('PostgresSink', () => {
@@ -57,6 +70,33 @@ describe.skipIf(!databaseUrl)('PostgresSink', () => {
       const client = new pg.Client({ connectionString: databaseUrl });
       await client.connect();
       await client.query(`DROP TABLE IF EXISTS ${dupTable}`);
+      await client.end();
+    }
+  });
+
+  it('commits the checkpoint in the same transaction as the batch', async () => {
+    const ckptTable = `${table}_ckpt`;
+    const sink = new PostgresSink(databaseUrl!, { table: ckptTable });
+    try {
+      expect(await sink.checkpoints.load(FILE)).toBeUndefined();
+      await sink.open();
+      await sink.writeBatch([tx(1)], checkpointAt(1));
+      expect(await sink.checkpoints.load(FILE)).toEqual(checkpointAt(1));
+
+      // 'TOOLONG' overflows char(3), so the COPY fails: neither the row nor the newer checkpoint lands.
+      await expect(
+        sink.writeBatch([tx(2, { currency: 'TOOLONG' as 'USD' })], checkpointAt(2)),
+      ).rejects.toThrow(/too long/);
+      expect(await sink.checkpoints.load(FILE)).toEqual(checkpointAt(1));
+      expect(await sink.count()).toBe(1);
+
+      await sink.checkpoints.clear(FILE);
+      expect(await sink.checkpoints.load(FILE)).toBeUndefined();
+    } finally {
+      await sink.close();
+      const client = new pg.Client({ connectionString: databaseUrl });
+      await client.connect();
+      await client.query(`DROP TABLE IF EXISTS ${ckptTable}`);
       await client.end();
     }
   });
