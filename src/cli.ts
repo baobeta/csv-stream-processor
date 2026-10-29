@@ -1,6 +1,7 @@
 import { parseArgs } from 'node:util';
 import { importCsv, type ImportProgress } from './import.ts';
 import { createSink, type SinkConfig } from './sinks/index.ts';
+import { ImportInProgressError } from './sinks/types.ts';
 
 const USAGE = `Usage: pnpm import <file.csv> [options]
 
@@ -65,13 +66,23 @@ function printProgress(p: ImportProgress): void {
   );
 }
 
-// Ctrl+C stops reading cleanly: pipeline() tears down every stage and the sink keeps only
-// fully committed batches; the checkpoint lets the next run continue from there.
+// Ctrl+C (SIGINT) and container stops (SIGTERM) stop reading cleanly: pipeline() tears down
+// every stage and the sink keeps only fully committed batches; the next run resumes from there.
+const SHUTDOWN_GRACE_MS = 30_000;
 const controller = new AbortController();
-process.once('SIGINT', () => {
-  process.stderr.write('\nSIGINT received, stopping import...\n');
-  controller.abort();
-});
+let abortExitCode = 130;
+for (const [signal, exitCode] of [
+  ['SIGINT', 130],
+  ['SIGTERM', 143],
+] as const) {
+  process.once(signal, () => {
+    process.stderr.write(`\n${signal} received, stopping import...\n`);
+    abortExitCode = exitCode;
+    controller.abort();
+    // The in-flight batch normally commits within a second; never hang a stop on a stuck query.
+    setTimeout(() => process.exit(exitCode), SHUTDOWN_GRACE_MS).unref();
+  });
+}
 
 const { sink, target } = createSink(sinkConfig());
 try {
@@ -96,7 +107,10 @@ try {
   process.stderr.write('\n');
   if (error instanceof Error && error.name === 'AbortError') {
     console.error('Import aborted. Committed batches are kept; run the same command to resume.');
-    process.exitCode = 130;
+    process.exitCode = abortExitCode;
+  } else if (error instanceof ImportInProgressError) {
+    console.error(error.message);
+    process.exitCode = 75; // EX_TEMPFAIL: try again later
   } else {
     console.error(error);
     process.exitCode = 1;
